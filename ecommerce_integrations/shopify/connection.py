@@ -171,11 +171,11 @@ def _validate_request(req, hmac_header):
 		secret_key = settings.shared_secret
 
 	if not secret_key:
-		create_shopify_log(status="Error", request_data=req.data, exception="Secret key not configured")
+		create_shopify_log(status="Error", request_data=req.data.decode("utf-8"), exception="Secret key not configured")
 		frappe.throw(_("Webhook validation failed: Secret key not configured"))
 
 	sig = base64.b64encode(hmac.new(secret_key.encode("utf8"), req.data, hashlib.sha256).digest())
 
 	if sig != bytes(hmac_header.encode()):
-		create_shopify_log(status="Error", request_data=req.data)
+		create_shopify_log(status="Error", request_data=req.data.decode("utf-8"))
 		frappe.throw(_("Unverified Webhook Data"))

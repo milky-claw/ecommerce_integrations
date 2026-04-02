@@ -152,6 +152,14 @@ class ShopifySetting(SettingController):
 
 	def _handle_webhooks(self):
 		"""Handle webhook registration/unregistration. Uses appropriate token based on auth method."""
+		# Also check DB for webhooks in case child table wasn't loaded (e.g. set_value API)
+		if self.is_enabled() and not self.webhooks:
+			db_webhooks = frappe.get_all(
+				"Shopify Webhooks", filters={"parent": self.name}, fields=["name"], limit=1
+			)
+			if db_webhooks:
+				self.reload()
+				return
 		if self.is_enabled() and not self.webhooks:
 			# Get the appropriate password/token for webhook registration
 			if self.authentication_method == "OAuth 2.0 Client Credentials":
