@@ -1,15 +1,18 @@
+import json
 from typing import Optional
 
 import frappe
 from frappe import _, msgprint
 from frappe.utils import cint, cstr
 from frappe.utils.nestedset import get_root_of
-from shopify.resources import Product, Variant
+from shopify.resources import Metafield, Product, Variant
 
 from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import ecommerce_item
 from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import (
+	ITEM_METAFIELDS_FIELD,
 	ITEM_SELLING_RATE_FIELD,
+	ITEM_TAGS_FIELD,
 	MODULE_NAME,
 	SETTING_DOCTYPE,
 	SHOPIFY_VARIANTS_ATTR_LIST,
@@ -59,6 +62,9 @@ class ShopifyProduct:
 			shopify_product = Product.find(self.product_id)
 			product_dict = shopify_product.to_dict()
 			self._make_item(product_dict)
+
+			# B5+B6: Sync tags and metafields to the ERPNext Item
+			_sync_tags_and_metafields(self.product_id, product_dict)
 
 	def _make_item(self, product_dict):
 		_add_weight_details(product_dict)
@@ -547,6 +553,56 @@ def update_default_variant_properties(
 		default_variant.price = price
 	if sku is not None:
 		default_variant.sku = sku
+
+
+def _sync_tags_and_metafields(product_id, product_dict):
+	"""B5+B6: Sync Shopify product tags and metafields to the ERPNext Item.
+
+	Finds the ERPNext Item linked to this Shopify product via Ecommerce Item,
+	then updates shopify_tags and shopify_metafields custom fields.
+	"""
+	# Find all ERPNext items linked to this product (template + variants)
+	ecom_items = frappe.get_all(
+		"Ecommerce Item",
+		filters={"integration": MODULE_NAME, "integration_item_code": str(product_id)},
+		pluck="erpnext_item_code",
+	)
+
+	if not ecom_items:
+		return
+
+	# B5: Tags come directly from product_dict
+	tags = product_dict.get("tags", "")
+
+	# B6: Fetch metafields from Shopify API
+	metafields_json = ""
+	try:
+		metafields_raw = Product.find(product_id).metafields()
+		if metafields_raw:
+			metafields_list = [mf.to_dict() for mf in metafields_raw]
+			# Keep only useful fields, strip internal Shopify metadata
+			metafields_clean = [
+				{
+					"namespace": mf.get("namespace"),
+					"key": mf.get("key"),
+					"value": mf.get("value"),
+					"type": mf.get("type"),
+				}
+				for mf in metafields_list
+			]
+			metafields_json = json.dumps(metafields_clean)
+	except Exception:
+		# Metafield fetch is non-critical — don't block product sync
+		pass
+
+	# Update all linked ERPNext Items
+	for item_code in ecom_items:
+		frappe.db.set_value(
+			"Item",
+			item_code,
+			{ITEM_TAGS_FIELD: tags, ITEM_METAFIELDS_FIELD: metafields_json},
+			update_modified=False,
+		)
 
 
 def write_upload_log(status: bool, product: Product, item, action="Created") -> None:

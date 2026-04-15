@@ -14,6 +14,7 @@ WEBHOOK_EVENTS = [
 	"orders/fulfilled",
 	"orders/cancelled",
 	"orders/partially_fulfilled",
+	"orders/edited",
 ]
 
 EVENT_MAPPER = {
@@ -22,6 +23,7 @@ EVENT_MAPPER = {
 	"orders/fulfilled": "ecommerce_integrations.shopify.fulfillment.prepare_delivery_note",
 	"orders/cancelled": "ecommerce_integrations.shopify.order.cancel_order",
 	"orders/partially_fulfilled": "ecommerce_integrations.shopify.fulfillment.prepare_delivery_note",
+	"orders/edited": "ecommerce_integrations.shopify.order.handle_order_edited",
 }
 
 SHOPIFY_VARIANTS_ATTR_LIST = ["option1", "option2", "option3"]
@@ -37,6 +39,18 @@ SUPPLIER_ID_FIELD = "shopify_supplier_id"
 ADDRESS_ID_FIELD = "shopify_address_id"
 ORDER_ITEM_DISCOUNT_FIELD = "shopify_item_discount"
 ITEM_SELLING_RATE_FIELD = "shopify_selling_rate"
+
+# Custom fields added for YourGreenhouses connector patches
+ORDER_DISCOUNT_CODES_FIELD = "shopify_discount_codes"
+ORDER_FINANCIAL_STATUS_FIELD = "shopify_financial_status"
+ORDER_FULFILLMENT_STATUS_FIELD = "shopify_fulfillment_status"
+ORDER_TIP_AMOUNT_FIELD = "shopify_tip_amount"
+ORDER_ITEM_PROPERTIES_FIELD = "shopify_line_item_properties"
+ORDER_ITEM_SHIPPING_METHOD_FIELD = "shopify_shipping_method"
+ITEM_TAGS_FIELD = "shopify_tags"
+ITEM_METAFIELDS_FIELD = "shopify_metafields"
+
+UNMATCHED_ITEM_CODE = "MISC-MANUAL"
 
 # ERPNext already defines the default UOMs from Shopify but names are different
 WEIGHT_TO_ERPNEXT_UOM_MAP = {"kg": "Kg", "g": "Gram", "oz": "Ounce", "lb": "Pound"}

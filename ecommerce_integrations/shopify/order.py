@@ -11,11 +11,18 @@ from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import (
 	CUSTOMER_ID_FIELD,
 	EVENT_MAPPER,
+	ORDER_DISCOUNT_CODES_FIELD,
+	ORDER_FINANCIAL_STATUS_FIELD,
+	ORDER_FULFILLMENT_STATUS_FIELD,
 	ORDER_ID_FIELD,
 	ORDER_ITEM_DISCOUNT_FIELD,
+	ORDER_ITEM_PROPERTIES_FIELD,
+	ORDER_ITEM_SHIPPING_METHOD_FIELD,
 	ORDER_NUMBER_FIELD,
 	ORDER_STATUS_FIELD,
+	ORDER_TIP_AMOUNT_FIELD,
 	SETTING_DOCTYPE,
+	UNMATCHED_ITEM_CODE,
 )
 from ecommerce_integrations.shopify.customer import ShopifyCustomer
 from ecommerce_integrations.shopify.product import create_items_if_not_exist, get_item_code
@@ -82,8 +89,11 @@ def create_sales_order(shopify_order, setting, company=None):
 	so = frappe.db.get_value("Sales Order", {ORDER_ID_FIELD: shopify_order.get("id")}, "name")
 
 	if not so:
+		# B9: Separate tips from regular line items
+		line_items, tip_total = _separate_tips(shopify_order.get("line_items", []))
+
 		items = get_order_items(
-			shopify_order.get("line_items"),
+			line_items,
 			setting,
 			getdate(shopify_order.get("created_at")),
 			taxes_inclusive=shopify_order.get("taxes_included"),
@@ -101,6 +111,13 @@ def create_sales_order(shopify_order, setting, company=None):
 
 			return ""
 
+		# B1: Extract order tags
+		order_tags = shopify_order.get("tags", "")
+
+		# B8: Extract discount code names
+		discount_codes = shopify_order.get("discount_codes", [])
+		discount_code_names = ", ".join(dc.get("code", "") for dc in discount_codes) if discount_codes else ""
+
 		taxes = get_order_taxes(shopify_order, setting, items)
 		so = frappe.get_doc(
 			{
@@ -108,6 +125,11 @@ def create_sales_order(shopify_order, setting, company=None):
 				"naming_series": setting.sales_order_series or "SO-Shopify-",
 				ORDER_ID_FIELD: str(shopify_order.get("id")),
 				ORDER_NUMBER_FIELD: shopify_order.get("name"),
+				ORDER_STATUS_FIELD: order_tags,  # B1: order tags
+				ORDER_FINANCIAL_STATUS_FIELD: shopify_order.get("financial_status", ""),  # B10
+				ORDER_FULFILLMENT_STATUS_FIELD: shopify_order.get("fulfillment_status", ""),  # B10
+				ORDER_DISCOUNT_CODES_FIELD: discount_code_names,  # B8
+				ORDER_TIP_AMOUNT_FIELD: tip_total,  # B9
 				"customer": customer,
 				"transaction_date": getdate(shopify_order.get("created_at")) or nowdate(),
 				"delivery_date": getdate(shopify_order.get("created_at")) or nowdate(),
@@ -136,39 +158,120 @@ def create_sales_order(shopify_order, setting, company=None):
 	return so
 
 
+def _separate_tips(line_items):
+	"""B9: Separate tip line items from regular line items.
+
+	Tips arrive as line items with title "Tip". Extract them, sum the amount,
+	and return only non-tip items for SO creation.
+	"""
+	regular_items = []
+	tip_total = 0.0
+
+	for item in line_items:
+		if cstr(item.get("title")).strip().lower() == "tip":
+			tip_total += flt(item.get("price", 0)) * cint(item.get("quantity", 1))
+		else:
+			regular_items.append(item)
+
+	return regular_items, tip_total
+
+
 def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 	items = []
-	all_product_exists = True
-	product_not_exists = []
 
 	for shopify_item in order_items:
-		if not shopify_item.get("product_exists"):
-			all_product_exists = False
-			product_not_exists.append(
-				{"title": shopify_item.get("title"), ORDER_ID_FIELD: shopify_item.get("id")}
-			)
-			continue
+		item_code = None
 
-		if all_product_exists:
+		if shopify_item.get("product_exists") and shopify_item.get("product_id"):
 			item_code = get_item_code(shopify_item)
-			items.append(
-				{
-					"item_code": item_code,
-					"item_name": shopify_item.get("name"),
-					"rate": _get_item_price(shopify_item, taxes_inclusive),
-					"delivery_date": delivery_date,
-					"qty": shopify_item.get("quantity"),
-					"stock_uom": shopify_item.get("uom") or "Nos",
-					"warehouse": setting.warehouse,
-					ORDER_ITEM_DISCOUNT_FIELD: (
-						_get_total_discount(shopify_item) / cint(shopify_item.get("quantity"))
-					),
-				}
+
+		# B12: Fallback to MISC-MANUAL for unmatched items
+		if not item_code:
+			item_code = UNMATCHED_ITEM_CODE
+			# Ensure the MISC-MANUAL item exists
+			_ensure_misc_manual_item(setting)
+
+		# B2: Extract line item properties (manufacturing instructions)
+		properties = shopify_item.get("properties", [])
+		properties_json = json.dumps(properties) if properties else ""
+
+		# B7: Resolve shipping method from product tags
+		shipping_method = _resolve_shipping_method(shopify_item)
+
+		item_row = {
+			"item_code": item_code,
+			"item_name": shopify_item.get("name") or shopify_item.get("title"),
+			"rate": _get_item_price(shopify_item, taxes_inclusive),
+			"delivery_date": delivery_date,
+			"qty": shopify_item.get("quantity"),
+			"stock_uom": shopify_item.get("uom") or "Nos",
+			"warehouse": setting.warehouse,
+			ORDER_ITEM_DISCOUNT_FIELD: (
+				_get_total_discount(shopify_item) / cint(shopify_item.get("quantity"))
+			),
+			ORDER_ITEM_PROPERTIES_FIELD: properties_json,  # B2
+			ORDER_ITEM_SHIPPING_METHOD_FIELD: shipping_method,  # B7
+		}
+
+		# B12: Store original title in description for unmatched items
+		if item_code == UNMATCHED_ITEM_CODE:
+			item_row["description"] = (
+				f"[UNMATCHED] {shopify_item.get('title', '')} "
+				f"(Shopify product_id: {shopify_item.get('product_id', 'N/A')}, "
+				f"variant_id: {shopify_item.get('variant_id', 'N/A')})"
 			)
-		else:
-			items = []
+
+		items.append(item_row)
 
 	return items
+
+
+def _ensure_misc_manual_item(setting):
+	"""B12: Create the MISC-MANUAL catch-all item if it doesn't exist."""
+	if not frappe.db.exists("Item", UNMATCHED_ITEM_CODE):
+		frappe.get_doc(
+			{
+				"doctype": "Item",
+				"item_code": UNMATCHED_ITEM_CODE,
+				"item_name": "Unmatched Shopify Line Item",
+				"description": "Placeholder for Shopify line items that could not be matched to an ERPNext Item. Requires manual resolution.",
+				"item_group": "Products",
+				"stock_uom": "Nos",
+				"is_stock_item": 0,
+				"default_warehouse": setting.warehouse,
+			}
+		).insert(ignore_permissions=True)
+
+
+def _resolve_shipping_method(shopify_item):
+	"""B7: Determine ship-sea or ship-air from the product's tags.
+
+	Looks up the ERPNext Item linked to this Shopify product and reads
+	the shopify_tags custom field. Returns 'ship-sea', 'ship-air', or ''.
+	"""
+	product_id = shopify_item.get("product_id")
+	if not product_id:
+		return ""
+
+	# Look up Ecommerce Item → ERPNext Item → shopify_tags
+	from ecommerce_integrations.shopify.constants import ITEM_TAGS_FIELD
+
+	erpnext_item_code = frappe.db.get_value(
+		"Ecommerce Item",
+		{"integration": "shopify", "integration_item_code": str(product_id)},
+		"erpnext_item_code",
+	)
+	if not erpnext_item_code:
+		return ""
+
+	tags = frappe.db.get_value("Item", erpnext_item_code, ITEM_TAGS_FIELD) or ""
+	tags_lower = tags.lower()
+
+	if "ship-sea" in tags_lower:
+		return "ship-sea"
+	elif "ship-air" in tags_lower:
+		return "ship-air"
+	return ""
 
 
 def _get_item_price(line_item, taxes_inclusive: bool) -> float:
@@ -398,6 +501,145 @@ def cancel_order(payload, request_id=None):
 		create_shopify_log(status="Error", exception=e)
 	else:
 		create_shopify_log(status="Success")
+
+
+def handle_order_edited(payload, request_id=None):
+	"""B13: Handle orders/edited webhook.
+
+	Compares the incoming edited order against the existing ERPNext Sales Order.
+	Creates a ToDo (task) for the operator with a human-readable diff.
+	Does NOT auto-modify the SO — operator decides the action.
+
+	Covers: warranty parts added, quantity changes, price adjustments,
+	item removals, address changes.
+	"""
+	frappe.set_user("Administrator")
+	frappe.flags.request_id = request_id
+
+	order = payload
+	try:
+		order_id = order.get("id")
+		sales_order = get_sales_order(order_id)
+
+		if not sales_order:
+			create_shopify_log(
+				status="Invalid",
+				message=f"Order edited webhook received but SO not found for Shopify order {order_id}",
+			)
+			return
+
+		# Build a diff summary
+		diff_lines = _build_order_edit_diff(sales_order, order)
+
+		if not diff_lines:
+			create_shopify_log(status="Success", message="Order edited but no material changes detected")
+			return
+
+		# Create a ToDo for the operator
+		diff_text = "\n".join(diff_lines)
+		todo_description = (
+			f"<b>Shopify Order Edited: {order.get('name', order_id)}</b><br><br>"
+			f"<b>Sales Order:</b> {sales_order.name}<br>"
+			f"<b>Customer:</b> {sales_order.customer}<br><br>"
+			f"<b>Changes detected:</b><br><pre>{diff_text}</pre><br><br>"
+			f"<b>Action required:</b> Review and decide whether to amend the SO, "
+			f"create a new SO, or ignore."
+		)
+
+		frappe.get_doc(
+			{
+				"doctype": "ToDo",
+				"description": todo_description,
+				"reference_type": "Sales Order",
+				"reference_name": sales_order.name,
+				"allocated_to": frappe.db.get_single_value(SETTING_DOCTYPE, "owner") or "Administrator",
+				"priority": "Medium",
+			}
+		).insert(ignore_permissions=True)
+
+		# Update order tags/status if changed
+		new_tags = order.get("tags", "")
+		if new_tags != (sales_order.get(ORDER_STATUS_FIELD) or ""):
+			frappe.db.set_value("Sales Order", sales_order.name, ORDER_STATUS_FIELD, new_tags)
+
+		# Update financial/fulfillment status
+		frappe.db.set_value(
+			"Sales Order",
+			sales_order.name,
+			{
+				ORDER_FINANCIAL_STATUS_FIELD: order.get("financial_status", ""),
+				ORDER_FULFILLMENT_STATUS_FIELD: order.get("fulfillment_status", ""),
+			},
+		)
+
+	except Exception as e:
+		create_shopify_log(status="Error", exception=e)
+	else:
+		create_shopify_log(status="Success")
+
+
+def _build_order_edit_diff(sales_order, shopify_order):
+	"""Compare existing SO items against the edited Shopify order line items."""
+	diff_lines = []
+
+	# Build lookup of current SO items by item_code
+	so_items = {}
+	for item in sales_order.items:
+		key = item.item_code
+		so_items.setdefault(key, []).append(item)
+
+	# Build lookup of Shopify line items by title (more human-readable)
+	shopify_items = {}
+	for li in shopify_order.get("line_items", []):
+		title = li.get("title", "Unknown")
+		shopify_items.setdefault(title, []).append(li)
+
+	# Detect new line items (by title, rough comparison)
+	existing_titles = {item.item_name for item in sales_order.items}
+	for title, items in shopify_items.items():
+		if title not in existing_titles:
+			for li in items:
+				price = li.get("price", "0")
+				qty = li.get("quantity", 1)
+				diff_lines.append(f"+ NEW ITEM: {title} (qty: {qty}, price: ${price})")
+
+	# Detect quantity/price changes for existing items
+	for item in sales_order.items:
+		matching = [
+			li for li in shopify_order.get("line_items", [])
+			if li.get("title") == item.item_name or li.get("sku") == item.item_code
+		]
+		for li in matching:
+			new_qty = cint(li.get("quantity"))
+			new_price = flt(li.get("price"))
+			if new_qty != cint(item.qty):
+				diff_lines.append(
+					f"~ QTY CHANGE: {item.item_name} — {cint(item.qty)} → {new_qty}"
+				)
+			if abs(new_price - flt(item.rate)) > 0.01:
+				diff_lines.append(
+					f"~ PRICE CHANGE: {item.item_name} — ${flt(item.rate):.2f} → ${new_price:.2f}"
+				)
+
+	# Detect removed items
+	shopify_titles = set()
+	shopify_skus = set()
+	for li in shopify_order.get("line_items", []):
+		shopify_titles.add(li.get("title"))
+		if li.get("sku"):
+			shopify_skus.add(li.get("sku"))
+
+	for item in sales_order.items:
+		if item.item_name not in shopify_titles and item.item_code not in shopify_skus:
+			diff_lines.append(f"- REMOVED: {item.item_name} (was qty: {cint(item.qty)})")
+
+	# Check address changes
+	shipping_addr = shopify_order.get("shipping_address", {})
+	if shipping_addr:
+		addr_str = f"{shipping_addr.get('address1', '')}, {shipping_addr.get('city', '')}, {shipping_addr.get('province', '')} {shipping_addr.get('zip', '')}"
+		diff_lines.append(f"  SHIPPING ADDRESS: {addr_str}")
+
+	return diff_lines
 
 
 @temp_shopify_session
