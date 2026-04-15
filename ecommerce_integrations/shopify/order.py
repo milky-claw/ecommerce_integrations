@@ -126,8 +126,8 @@ def create_sales_order(shopify_order, setting, company=None):
 				ORDER_ID_FIELD: str(shopify_order.get("id")),
 				ORDER_NUMBER_FIELD: shopify_order.get("name"),
 				ORDER_STATUS_FIELD: order_tags,  # B1: order tags
-				ORDER_FINANCIAL_STATUS_FIELD: shopify_order.get("financial_status", ""),  # B10
-				ORDER_FULFILLMENT_STATUS_FIELD: shopify_order.get("fulfillment_status", ""),  # B10
+				ORDER_FINANCIAL_STATUS_FIELD: shopify_order.get("financial_status") or "",  # B10
+				ORDER_FULFILLMENT_STATUS_FIELD: shopify_order.get("fulfillment_status") or "",  # B10
 				ORDER_DISCOUNT_CODES_FIELD: discount_code_names,  # B8
 				ORDER_TIP_AMOUNT_FIELD: tip_total,  # B9
 				"customer": customer,
@@ -567,8 +567,8 @@ def handle_order_edited(payload, request_id=None):
 			"Sales Order",
 			sales_order.name,
 			{
-				ORDER_FINANCIAL_STATUS_FIELD: order.get("financial_status", ""),
-				ORDER_FULFILLMENT_STATUS_FIELD: order.get("fulfillment_status", ""),
+				ORDER_FINANCIAL_STATUS_FIELD: order.get("financial_status") or "",
+				ORDER_FULFILLMENT_STATUS_FIELD: order.get("fulfillment_status") or "",
 			},
 		)
 
