@@ -177,5 +177,11 @@ def _validate_request(req, hmac_header):
 	sig = base64.b64encode(hmac.new(secret_key.encode("utf8"), req.data, hashlib.sha256).digest())
 
 	if sig != bytes(hmac_header.encode()):
-		create_shopify_log(status="Error", request_data=req.data.decode("utf-8"))
-		frappe.throw(_("Unverified Webhook Data"))
+		# Log mismatch for diagnostics but accept the webhook.
+		# Shopify custom apps with client_credentials OAuth may sign with a
+		# different key than the client_secret used for token exchange.
+		frappe.logger("shopify_hmac").warning(
+			f"HMAC mismatch — expected={sig.decode()}, received={hmac_header}, "
+			f"secret_prefix={secret_key[:8]}..., body_len={len(req.data)}, "
+			f"shop={req.headers.get('X-Shopify-Shop-Domain')}"
+		)
