@@ -10,6 +10,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [Unreleased] — pending deploy to bench-37067
+
+Commit `597356c` on `version-16`. Will be tagged `yei-v1.1.0` once deploy is confirmed Active.
+
+### Changed
+- **B15 revision** (`597356c` supersedes `f140ffb`): set `rate == price_list_rate` to the same discounted-dollar value rather than using `discount_percentage`. Matches Shopify's dollar-amount discount model (no percentage conversion, no rounding). Root cause of #4344 isolated via direct save+submit test matrix: `rate=0` alone survives cleanly, but `rate=0 + price_list_rate=X>0` triggers ERPNext's reconciliation path. Fix short-circuits reconciliation because plr == rate. Per-unit discount audit preserved in `shopify_item_discount` custom field. 11 rewritten tests in `TestB15DiscountDollarAmount`, including the core invariant `test_rate_equals_price_list_rate_invariant` and explicit `test_no_percentage_conversion_no_rounding` using $33.33/$100. 66/66 total tests pass.
+
+### Known (not yet fixed in code)
+- `orders/edited` webhook was registered on Shopify out-of-band via Admin API (webhook id `1890513060203`) because the connector's `WEBHOOK_EVENTS` listed it but the 2026-04-17 HMAC re-registration helper somehow missed this one topic. Consider adding a defensive re-registration check in `connection.py` that reconciles Shopify's webhook list against `WEBHOOK_EVENTS` on startup.
+
+---
+
 ## [yei-v1.0.0] — 2026-04-17
 
 First tagged fork release. Captures all fork-specific commits through `f140ffb`. Encompasses the full 04c connector-patches body of work (B1–B15) + webhook robustness fixes.
@@ -23,7 +35,7 @@ First tagged fork release. Captures all fork-specific commits through `f140ffb`.
 | `2415fb7` | upstream hardening | handle null `fulfillment_status` from Shopify; +47 unit tests |
 | `6a4a492` | webhook compatibility | accept HMAC mismatches with warning (do not throw) — allows our client-secret rotation to not take the site down |
 | `708a753` | **B14 — critical data integrity fix** | `_match_sku_and_link_item` was skipping SKU-match for all variant products (multi-variant SKUs were being linked to phantom variant_id Items instead of the canonical ERPNext Item with the matching SKU). Fix drops the `variant_of` guard. Plus 8 new tests (`TestB14VariantSKUMatch`, `TestB14BugRegression`) |
-| `f140ffb` | **B15 — pricing correctness fix** | Live webhook #4344 over-charged $69.60: connector set only `rate`, but ERPNext's save/submit reconciles rate from `price_list_rate × (1 − discount_percentage/100)` and overwrote our value with the non-discounted master price. Fix emits the canonical ERPNext discount triple on every SO Item (`price_list_rate`, `discount_percentage`, `rate` — defensively redundant but immune to re-fetch). Plus 10 tests (`TestB15DiscountViaPriceListRate`). Also surfaced that `orders/edited` webhook was never registered on Shopify despite being in `WEBHOOK_EVENTS` — re-registered out-of-band via Shopify Admin API. |
+| `f140ffb` | **B15 — pricing correctness fix** (superseded by `597356c`) | Live webhook #4344 over-charged $69.60: connector set only `rate`, but ERPNext's save/submit reconciles rate from `price_list_rate`. First attempt used `discount_percentage` — introduced percentage rounding, didn't match Shopify's dollar-amount model. Superseded in `[Unreleased]` by the simpler rate-equals-plr approach. |
 
 ### What our fork delivers on top of upstream v16
 
