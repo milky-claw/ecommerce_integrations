@@ -1,6 +1,6 @@
 # Changelog — `milky-claw/ecommerce_integrations` fork
 
-Fork-specific changes on top of upstream `frappe/ecommerce_integrations` (branch `version-16`). Upstream tags (`v1.x.y`, `v16.0.0`) remain as-is; our fork's additions use the `ygh-v*` prefix to avoid namespace collision.
+Fork-specific changes on top of upstream `frappe/ecommerce_integrations` (branch `version-16`). Upstream tags (`v1.x.y`, `v16.0.0`) remain as-is; our fork's additions use the **`yei-v*`** prefix (YGH Ecommerce Integrations) to avoid namespace collision with upstream and with sibling apps like `ygf-*` (the YGH FedEx app).
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning SemVer-for-our-fork starting at `ygh-v1.0.0`.
 
@@ -10,7 +10,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
-## [ygh-v1.0.0] — 2026-04-17
+## [yei-v1.0.0] — 2026-04-17
 
 First tagged fork release. Captures all fork-specific commits through `f140ffb`. Encompasses the full 04c connector-patches body of work (B1–B15) + webhook robustness fixes.
 
