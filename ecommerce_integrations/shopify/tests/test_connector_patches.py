@@ -823,7 +823,7 @@ class TestB14BugRegression(unittest.TestCase):
         self.assertTrue(result, "Patched version must link when SKU matches real Item")
 
 
-# ── B15: discount via price_list_rate + discount_percentage ────────────
+# ── B15: discount via dollar-amount rate (matching Shopify's model) ────
 #
 # Regression: the connector used to set `rate = price - discount/qty`
 # and rely on ERPNext to keep it. On fully-discounted lines (e.g. FREE
@@ -834,12 +834,18 @@ class TestB14BugRegression(unittest.TestCase):
 # 2×RGB-GST bed kit with $69.60 line discount landed with rate=$34.80
 # (full price) instead of $0.00, over-charging the order by $69.60.
 #
-# Fix: emit the canonical ERPNext discount triple:
-#   price_list_rate = net_unit_price (pre-discount, post-tax)
-#   discount_percentage = (per_unit_discount / net_unit_price) × 100
-#   rate = net_unit_price - per_unit_discount (defensive redundancy)
-# ERPNext computes rate = price_list_rate × (1 - pct/100), which matches
-# our explicit rate. Either path gives the right answer.
+# Isolated cause (verified via direct save+submit test matrix):
+#   rate=0 alone                → survives cleanly
+#   rate=0 + price_list_rate=P  → ERPNext reconciles rate back to P
+# ERPNext's save() pipeline populates price_list_rate during
+# `set_missing_values`, and when plr ≠ rate it reconciles. The connector
+# didn't explicitly set plr, but ERPNext filled it anyway.
+#
+# Fix: set BOTH rate AND price_list_rate to the SAME discounted dollar
+# value. Matches Shopify's dollar-amount model (no percentage conversion,
+# no rounding). Short-circuits reconciliation because plr == rate. The
+# original per-unit discount is preserved in `shopify_item_discount`
+# (custom field) for audit.
 
 
 def _build_item_row(shopify_item, taxes_inclusive, setting_warehouse="W"):
@@ -857,24 +863,19 @@ def _build_item_row(shopify_item, taxes_inclusive, setting_warehouse="W"):
     else:
         per_unit_tax = 0.0
 
-    net_unit_price = price - per_unit_tax
-    effective_rate = net_unit_price - per_unit_discount
-    discount_pct = (
-        (per_unit_discount / net_unit_price) * 100 if net_unit_price > 0 else 0.0
-    )
+    effective_rate = price - per_unit_tax - per_unit_discount
 
     return {
         "rate": effective_rate,
-        "price_list_rate": net_unit_price,
-        "discount_percentage": discount_pct,
+        "price_list_rate": effective_rate,  # match to disable ERPNext reconciliation
         "qty": qty,
         "shopify_item_discount": per_unit_discount,
     }
 
 
-class TestB15DiscountViaPriceListRate(unittest.TestCase):
+class TestB15DiscountDollarAmount(unittest.TestCase):
     def test_fully_discounted_line_free_gift(self):
-        """#4344 regression: 2×$34.80 with $69.60 line discount → rate=0, pct=100."""
+        """#4344 regression: 2×$34.80 with $69.60 line discount → rate=0."""
         item = {
             "price": "34.80",
             "quantity": 2,
@@ -882,12 +883,13 @@ class TestB15DiscountViaPriceListRate(unittest.TestCase):
         }
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 0.0)
-        self.assertEqual(row["price_list_rate"], 34.80)
-        self.assertEqual(row["discount_percentage"], 100.0)
-        self.assertEqual(row["shopify_item_discount"], 34.80)
+        self.assertEqual(row["price_list_rate"], 0.0,
+                         msg="plr must equal rate to prevent ERPNext reconciliation")
+        self.assertEqual(row["shopify_item_discount"], 34.80,
+                         msg="per-unit discount preserved in audit field")
 
     def test_partially_discounted_line(self):
-        """$100 item with $25 line discount on qty=1 → rate=75, pct=25."""
+        """$100 item with $25 line discount on qty=1 → rate=75."""
         item = {
             "price": "100.00",
             "quantity": 1,
@@ -895,16 +897,16 @@ class TestB15DiscountViaPriceListRate(unittest.TestCase):
         }
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 75.0)
-        self.assertEqual(row["price_list_rate"], 100.0)
-        self.assertEqual(row["discount_percentage"], 25.0)
+        self.assertEqual(row["price_list_rate"], 75.0)
+        self.assertEqual(row["shopify_item_discount"], 25.0)
 
     def test_no_discount(self):
-        """Plain line: rate=price, pct=0."""
+        """Plain line: rate=price, plr=price."""
         item = {"price": "180.00", "quantity": 1, "discount_allocations": []}
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 180.0)
         self.assertEqual(row["price_list_rate"], 180.0)
-        self.assertEqual(row["discount_percentage"], 0.0)
+        self.assertEqual(row["shopify_item_discount"], 0.0)
 
     def test_zero_amount_discount_allocation(self):
         """Shopify often sends discount_allocations=[{amount:0}] for un-discounted
@@ -916,7 +918,7 @@ class TestB15DiscountViaPriceListRate(unittest.TestCase):
         }
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 34.80)
-        self.assertEqual(row["discount_percentage"], 0.0)
+        self.assertEqual(row["shopify_item_discount"], 0.0)
 
     def test_multiple_discount_allocations(self):
         """Order-level + line-level discount both allocate to one line."""
@@ -930,10 +932,10 @@ class TestB15DiscountViaPriceListRate(unittest.TestCase):
         }
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 75.0)
-        self.assertEqual(row["discount_percentage"], 25.0)
+        self.assertEqual(row["shopify_item_discount"], 25.0)
 
     def test_taxes_inclusive_no_discount(self):
-        """Taxes inclusive: price=120 includes $20 tax, qty=1, no discount → rate=100."""
+        """Taxes inclusive: price=120 includes $20 tax, qty=1 → rate=100."""
         item = {
             "price": "120.00",
             "quantity": 1,
@@ -945,7 +947,7 @@ class TestB15DiscountViaPriceListRate(unittest.TestCase):
         self.assertEqual(row["price_list_rate"], 100.0)
 
     def test_taxes_inclusive_with_discount(self):
-        """Tax-inclusive $120, $10 tax, $20 discount → net pre-discount=110, rate=90."""
+        """Tax-inclusive $120, $10 tax, $20 discount → rate = 120-10-20 = 90."""
         item = {
             "price": "120.00",
             "quantity": 1,
@@ -954,8 +956,7 @@ class TestB15DiscountViaPriceListRate(unittest.TestCase):
         }
         row = _build_item_row(item, taxes_inclusive=True)
         self.assertAlmostEqual(row["rate"], 90.0)
-        self.assertAlmostEqual(row["price_list_rate"], 110.0)
-        self.assertAlmostEqual(row["discount_percentage"], 20.0 / 110.0 * 100, places=4)
+        self.assertAlmostEqual(row["price_list_rate"], 90.0)
 
     def test_qty_zero_is_normalized_to_one(self):
         """Shopify can't send qty=0 but belt-and-braces: don't crash on div-by-zero."""
@@ -965,27 +966,41 @@ class TestB15DiscountViaPriceListRate(unittest.TestCase):
         self.assertEqual(row["qty"], 1)
 
     def test_zero_price_line(self):
-        """Free item (price=0): rate=0, pct=0 (no div-by-zero)."""
+        """Free item (price=0): rate=0, no div-by-zero."""
         item = {"price": "0", "quantity": 1, "discount_allocations": []}
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 0.0)
-        self.assertEqual(row["discount_percentage"], 0.0)
+        self.assertEqual(row["price_list_rate"], 0.0)
 
-    def test_erpnext_formula_matches(self):
-        """Verify: rate == price_list_rate × (1 - pct/100).
-        If ERPNext recomputes rate from this formula, we still get the right answer."""
+    def test_rate_equals_price_list_rate_invariant(self):
+        """Core invariant: rate must always equal price_list_rate to prevent
+        ERPNext's save() from reconciling rate back to the non-discounted price."""
         cases = [
             {"price": "34.80", "quantity": 2, "discount_allocations": [{"amount": "69.60"}]},
             {"price": "100.00", "quantity": 1, "discount_allocations": [{"amount": "25.00"}]},
             {"price": "50.00", "quantity": 4, "discount_allocations": [{"amount": "20.00"}]},
+            {"price": "34.80", "quantity": 3, "discount_allocations": []},
+            {"price": "0", "quantity": 1, "discount_allocations": []},
         ]
         for c in cases:
             row = _build_item_row(c, taxes_inclusive=False)
-            computed = row["price_list_rate"] * (1 - row["discount_percentage"] / 100)
-            self.assertAlmostEqual(
-                row["rate"], computed, places=4,
-                msg=f"Divergence for {c}: rate={row['rate']} vs formula={computed}"
+            self.assertEqual(
+                row["rate"], row["price_list_rate"],
+                msg=f"Invariant violated for {c}: rate={row['rate']} != plr={row['price_list_rate']}",
             )
+
+    def test_no_percentage_conversion_no_rounding(self):
+        """Dollar-amount model must not introduce rounding from percentage conversion.
+        Test with a non-clean-percent case: $33.33 discount on $100 would be
+        33.33% which rounds; our dollar-amount approach is exact."""
+        item = {
+            "price": "100.00",
+            "quantity": 1,
+            "discount_allocations": [{"amount": "33.33"}],
+        }
+        row = _build_item_row(item, taxes_inclusive=False)
+        self.assertEqual(row["rate"], 100.00 - 33.33)  # exact, no rounding
+        self.assertEqual(row["shopify_item_discount"], 33.33)
 
 
 if __name__ == "__main__":

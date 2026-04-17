@@ -198,13 +198,18 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 		# B7: Resolve shipping method from product tags
 		shipping_method = _resolve_shipping_method(shopify_item)
 
-		# B15: use price_list_rate + discount_percentage instead of raw rate.
-		# When rate is set to the discounted value directly, ERPNext's
-		# save/submit pipeline can silently reset it back to price_list_rate
-		# (observed on live webhook #4344: connector computed rate=$0.00 for
-		# a fully-discounted line but SO ended up with rate=$34.80 and the
-		# $69.60 line discount lost). Using ERPNext's canonical discount
-		# fields is immune to that override.
+		# B15: set rate AND price_list_rate to the SAME discounted dollar
+		# value. Shopify's model is dollar amounts (discount_allocations),
+		# not percentages — preserve that intent.
+		#
+		# Why set price_list_rate at all?  ERPNext's server-side
+		# save()+submit() reconciles rate whenever price_list_rate differs
+		# from the caller-supplied rate (confirmed via direct test: rate=0
+		# alone survives, but rate=0 + plr=34.80 resets rate to 34.80).
+		# ERPNext's `set_missing_values` pipeline can populate plr during
+		# save from sources the connector can't easily predict. By setting
+		# plr=rate explicitly, we short-circuit reconciliation — plr and
+		# rate match, no override.
 		price = flt(shopify_item.get("price"))
 		qty = cint(shopify_item.get("quantity")) or 1
 		total_discount = _get_total_discount(shopify_item)
@@ -217,26 +222,18 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 		else:
 			per_unit_tax = 0.0
 
-		net_unit_price = price - per_unit_tax  # pre-discount, post-tax
-		effective_rate = net_unit_price - per_unit_discount
-		discount_pct = (
-			(per_unit_discount / net_unit_price) * 100 if net_unit_price > 0 else 0.0
-		)
+		effective_rate = price - per_unit_tax - per_unit_discount  # Shopify's dollars, net-of-tax, post-discount
 
 		item_row = {
 			"item_code": item_code,
 			"item_name": shopify_item.get("name") or shopify_item.get("title"),
-			# Redundancy: set rate AND price_list_rate AND discount_percentage.
-			# ERPNext will compute rate from price_list_rate*(1-pct/100) during
-			# validation, which matches our effective_rate. If it doesn't
-			# recompute, rate we set stands. Either way: right answer.
 			"rate": effective_rate,
-			"price_list_rate": net_unit_price,
-			"discount_percentage": discount_pct,
+			"price_list_rate": effective_rate,  # match rate to disable reconciliation
 			"delivery_date": delivery_date,
 			"qty": qty,
 			"stock_uom": shopify_item.get("uom") or "Nos",
 			"warehouse": setting.warehouse,
+			# Audit trail: original per-unit discount preserved in custom field
 			ORDER_ITEM_DISCOUNT_FIELD: per_unit_discount,
 			ORDER_ITEM_PROPERTIES_FIELD: properties_json,  # B2
 			ORDER_ITEM_SHIPPING_METHOD_FIELD: shipping_method,  # B7
