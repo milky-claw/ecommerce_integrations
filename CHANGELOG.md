@@ -12,7 +12,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ## [ygh-v1.0.0] — 2026-04-17
 
-First tagged fork release. Captures all fork-specific commits through `708a753`. Encompasses the full 04c connector-patches body of work (B1–B14) + webhook robustness fixes.
+First tagged fork release. Captures all fork-specific commits through `f140ffb`. Encompasses the full 04c connector-patches body of work (B1–B15) + webhook robustness fixes.
 
 ### Commit inventory (fork-vs-upstream)
 
@@ -23,6 +23,7 @@ First tagged fork release. Captures all fork-specific commits through `708a753`.
 | `2415fb7` | upstream hardening | handle null `fulfillment_status` from Shopify; +47 unit tests |
 | `6a4a492` | webhook compatibility | accept HMAC mismatches with warning (do not throw) — allows our client-secret rotation to not take the site down |
 | `708a753` | **B14 — critical data integrity fix** | `_match_sku_and_link_item` was skipping SKU-match for all variant products (multi-variant SKUs were being linked to phantom variant_id Items instead of the canonical ERPNext Item with the matching SKU). Fix drops the `variant_of` guard. Plus 8 new tests (`TestB14VariantSKUMatch`, `TestB14BugRegression`) |
+| `f140ffb` | **B15 — pricing correctness fix** | Live webhook #4344 over-charged $69.60: connector set only `rate`, but ERPNext's save/submit reconciles rate from `price_list_rate × (1 − discount_percentage/100)` and overwrote our value with the non-discounted master price. Fix emits the canonical ERPNext discount triple on every SO Item (`price_list_rate`, `discount_percentage`, `rate` — defensively redundant but immune to re-fetch). Plus 10 tests (`TestB15DiscountViaPriceListRate`). Also surfaced that `orders/edited` webhook was never registered on Shopify despite being in `WEBHOOK_EVENTS` — re-registered out-of-band via Shopify Admin API. |
 
 ### What our fork delivers on top of upstream v16
 
