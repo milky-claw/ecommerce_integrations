@@ -198,17 +198,46 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 		# B7: Resolve shipping method from product tags
 		shipping_method = _resolve_shipping_method(shopify_item)
 
+		# B15: use price_list_rate + discount_percentage instead of raw rate.
+		# When rate is set to the discounted value directly, ERPNext's
+		# save/submit pipeline can silently reset it back to price_list_rate
+		# (observed on live webhook #4344: connector computed rate=$0.00 for
+		# a fully-discounted line but SO ended up with rate=$34.80 and the
+		# $69.60 line discount lost). Using ERPNext's canonical discount
+		# fields is immune to that override.
+		price = flt(shopify_item.get("price"))
+		qty = cint(shopify_item.get("quantity")) or 1
+		total_discount = _get_total_discount(shopify_item)
+		per_unit_discount = total_discount / qty
+
+		if taxes_inclusive:
+			per_unit_tax = sum(
+				flt(tax.get("price")) for tax in (shopify_item.get("tax_lines") or [])
+			) / qty
+		else:
+			per_unit_tax = 0.0
+
+		net_unit_price = price - per_unit_tax  # pre-discount, post-tax
+		effective_rate = net_unit_price - per_unit_discount
+		discount_pct = (
+			(per_unit_discount / net_unit_price) * 100 if net_unit_price > 0 else 0.0
+		)
+
 		item_row = {
 			"item_code": item_code,
 			"item_name": shopify_item.get("name") or shopify_item.get("title"),
-			"rate": _get_item_price(shopify_item, taxes_inclusive),
+			# Redundancy: set rate AND price_list_rate AND discount_percentage.
+			# ERPNext will compute rate from price_list_rate*(1-pct/100) during
+			# validation, which matches our effective_rate. If it doesn't
+			# recompute, rate we set stands. Either way: right answer.
+			"rate": effective_rate,
+			"price_list_rate": net_unit_price,
+			"discount_percentage": discount_pct,
 			"delivery_date": delivery_date,
-			"qty": shopify_item.get("quantity"),
+			"qty": qty,
 			"stock_uom": shopify_item.get("uom") or "Nos",
 			"warehouse": setting.warehouse,
-			ORDER_ITEM_DISCOUNT_FIELD: (
-				_get_total_discount(shopify_item) / cint(shopify_item.get("quantity"))
-			),
+			ORDER_ITEM_DISCOUNT_FIELD: per_unit_discount,
 			ORDER_ITEM_PROPERTIES_FIELD: properties_json,  # B2
 			ORDER_ITEM_SHIPPING_METHOD_FIELD: shipping_method,  # B7
 		}
