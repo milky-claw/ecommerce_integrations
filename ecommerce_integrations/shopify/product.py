@@ -283,7 +283,12 @@ def _match_sku_and_link_item(item_dict, product_id, variant_id, variant_of=None,
 	Returns true if matched and linked.
 	"""
 	sku = item_dict["sku"]
-	if not sku or variant_of or has_variant:
+	# B14: do NOT skip when variant_of is set. ERPNext items may be flat
+	# (one Item per SKU, no template/variant structure) even when Shopify
+	# imports them under a template umbrella. Skipping on variant_of caused
+	# every Shopify variant to create a phantom Item named after variant_id
+	# and a self-pointing Ecommerce Item mapping.
+	if not sku or has_variant:
 		return False
 
 	item_name = frappe.db.get_value("Item", {"item_code": sku})

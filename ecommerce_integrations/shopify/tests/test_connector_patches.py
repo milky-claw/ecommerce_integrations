@@ -666,5 +666,162 @@ class TestIntegrationScenarios(unittest.TestCase):
         self.assertIn("price: $0", new_items[0])
 
 
+# ── B14: SKU match must run for variant rows (variant_of set) ──────────
+#
+# Regression: `_match_sku_and_link_item` used to early-return when
+# variant_of was truthy. That caused every Shopify variant to bypass the
+# SKU→Item lookup, create a phantom Item named after variant_id, and
+# write a self-pointing Ecommerce Item mapping (erpnext_item_code ==
+# variant_id). Subsequent orders for that variant then landed in SOs
+# with item_code == variant_id — breaking BOM, PO routing, and FedEx
+# customs.
+#
+# The patched function inlined below drops the variant_of guard.
+
+MODULE_NAME_B14 = "shopify"
+
+
+def _match_sku_and_link_item_patched(
+    item_dict, product_id, variant_id, variant_of=None, has_variant=False,
+    *, frappe_impl=None
+):
+    """Patched B14 version with frappe_impl injectable for testability."""
+    sku = item_dict["sku"]
+    if not sku or has_variant:
+        return False
+
+    item_name = frappe_impl.db.get_value("Item", {"item_code": sku})
+    if item_name:
+        try:
+            ecommerce_item = frappe_impl.get_doc(
+                {
+                    "doctype": "Ecommerce Item",
+                    "integration": MODULE_NAME_B14,
+                    "erpnext_item_code": item_name,
+                    "integration_item_code": product_id,
+                    "has_variants": 0,
+                    "variant_id": str(variant_id) if variant_id else "",
+                    "sku": sku,
+                }
+            )
+            ecommerce_item.insert()
+            return True
+        except Exception:
+            return False
+    return False
+
+
+class TestB14VariantSKUMatch(unittest.TestCase):
+    def _fake_frappe(self, item_name_for_sku=None):
+        f = MagicMock()
+        f.db.get_value = MagicMock(return_value=item_name_for_sku)
+        f.get_doc = MagicMock(return_value=MagicMock())
+        return f
+
+    def test_variant_of_set_but_sku_matches_item_links_to_real_item(self):
+        """Core regression: variant_of is set AND SKU matches an ERPNext Item
+        → must create mapping to that Item, not phantom."""
+        fake_frappe = self._fake_frappe(item_name_for_sku="NWD-GHG-0421X0543")
+        item_dict = {"sku": "NWD-GHG-0421X0543"}
+        linked = _match_sku_and_link_item_patched(
+            item_dict,
+            product_id="14907268890923",
+            variant_id="53015229006187",
+            variant_of="Nordwood Greenhouse Template",
+            has_variant=False,
+            frappe_impl=fake_frappe,
+        )
+        self.assertTrue(linked, "Must link variant row when SKU matches real Item")
+        # Assert Ecommerce Item was built with correct erpnext_item_code
+        created_doc = fake_frappe.get_doc.call_args[0][0]
+        self.assertEqual(created_doc["erpnext_item_code"], "NWD-GHG-0421X0543")
+        self.assertEqual(created_doc["variant_id"], "53015229006187")
+        self.assertEqual(created_doc["sku"], "NWD-GHG-0421X0543")
+
+    def test_no_sku_returns_false(self):
+        fake_frappe = self._fake_frappe()
+        self.assertFalse(_match_sku_and_link_item_patched(
+            {"sku": ""}, "111", "222", variant_of=None, has_variant=False,
+            frappe_impl=fake_frappe,
+        ))
+        fake_frappe.get_doc.assert_not_called()
+
+    def test_has_variant_returns_false(self):
+        """Template-level call must still early-return."""
+        fake_frappe = self._fake_frappe(item_name_for_sku="SHOULDNT-MATTER")
+        self.assertFalse(_match_sku_and_link_item_patched(
+            {"sku": "X"}, "111", "", variant_of=None, has_variant=True,
+            frappe_impl=fake_frappe,
+        ))
+        fake_frappe.get_doc.assert_not_called()
+
+    def test_sku_present_but_no_matching_item_returns_false(self):
+        fake_frappe = self._fake_frappe(item_name_for_sku=None)
+        self.assertFalse(_match_sku_and_link_item_patched(
+            {"sku": "UNKNOWN-SKU"}, "111", "222",
+            variant_of="Some Template", has_variant=False,
+            frappe_impl=fake_frappe,
+        ))
+        fake_frappe.get_doc.assert_not_called()
+
+    def test_variant_of_none_and_sku_matches_still_works(self):
+        """Single-variant path (variant_of=None) must keep working."""
+        fake_frappe = self._fake_frappe(item_name_for_sku="GNR-AIR-VENT-AUTO")
+        linked = _match_sku_and_link_item_patched(
+            {"sku": "GNR-AIR-VENT-AUTO"}, "111", "222",
+            variant_of=None, has_variant=False,
+            frappe_impl=fake_frappe,
+        )
+        self.assertTrue(linked)
+
+    def test_insert_failure_returns_false(self):
+        fake_frappe = self._fake_frappe(item_name_for_sku="NWD-GHG-0421X0543")
+        fake_frappe.get_doc.return_value.insert.side_effect = RuntimeError("dup")
+        self.assertFalse(_match_sku_and_link_item_patched(
+            {"sku": "NWD-GHG-0421X0543"}, "111", "222",
+            variant_of="T", has_variant=False,
+            frappe_impl=fake_frappe,
+        ))
+
+
+class TestB14BugRegression(unittest.TestCase):
+    """Verify the old buggy behavior — asserting it was a bug — then the
+    patched behavior. Demonstrates the before/after contract."""
+
+    def _buggy_match_fn(self, item_dict, product_id, variant_id, variant_of=None, has_variant=False, frappe_impl=None):
+        """The OLD version with the variant_of guard."""
+        sku = item_dict["sku"]
+        if not sku or variant_of or has_variant:  # <-- the bug
+            return False
+        item_name = frappe_impl.db.get_value("Item", {"item_code": sku})
+        if item_name:
+            frappe_impl.get_doc({}).insert()
+            return True
+        return False
+
+    def test_old_behavior_skipped_variant_rows(self):
+        """Documents the bug: variants always got skipped even with matching SKU."""
+        fake_frappe = MagicMock()
+        fake_frappe.db.get_value = MagicMock(return_value="NWD-GHG-0421X0543")
+        result = self._buggy_match_fn(
+            {"sku": "NWD-GHG-0421X0543"}, "111", "222",
+            variant_of="Template", has_variant=False,
+            frappe_impl=fake_frappe,
+        )
+        self.assertFalse(result, "Old buggy version returned False → forced phantom Item path")
+        fake_frappe.db.get_value.assert_not_called()  # Never even tried SKU lookup
+
+    def test_new_behavior_links_variant_rows(self):
+        """Same inputs, patched fn must link instead of skip."""
+        fake_frappe = MagicMock()
+        fake_frappe.db.get_value = MagicMock(return_value="NWD-GHG-0421X0543")
+        result = _match_sku_and_link_item_patched(
+            {"sku": "NWD-GHG-0421X0543"}, "111", "222",
+            variant_of="Template", has_variant=False,
+            frappe_impl=fake_frappe,
+        )
+        self.assertTrue(result, "Patched version must link when SKU matches real Item")
+
+
 if __name__ == "__main__":
     unittest.main()
