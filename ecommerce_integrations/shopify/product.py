@@ -327,7 +327,13 @@ def create_items_if_not_exist(order):
 def get_item_code(shopify_item):
 	"""Get item code using shopify_item dict.
 
-	Item should contain both product_id and variant_id."""
+	Item should contain both product_id and variant_id.
+
+	B16: Falls back to product-level Ecommerce Item match (without variant_id
+	filter) when the specific sku/variant lookup fails. Handles SKU-less
+	products (dropship, unassigned catalog items) where we maintain a
+	product_id → representative item_code mapping.
+	"""
 
 	item = ecommerce_item.get_erpnext_item(
 		integration=MODULE_NAME,
@@ -337,6 +343,18 @@ def get_item_code(shopify_item):
 	)
 	if item:
 		return item.item_code
+
+	# B16: product-level fallback (no SKU, no variant match) — used for
+	# dropship products and any catalog items without pushed SKUs.
+	if shopify_item.get("product_id"):
+		item = ecommerce_item.get_erpnext_item(
+			integration=MODULE_NAME,
+			integration_item_code=shopify_item.get("product_id"),
+			variant_id=None,  # explicit — don't filter by variant
+			sku=None,
+		)
+		if item:
+			return item.item_code
 
 
 @temp_shopify_session

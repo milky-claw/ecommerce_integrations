@@ -13,6 +13,7 @@ from ecommerce_integrations.shopify.constants import (
 	EVENT_MAPPER,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
+	ORDER_FULFILLMENT_SOURCE_FIELD,
 	ORDER_FULFILLMENT_STATUS_FIELD,
 	ORDER_ID_FIELD,
 	ORDER_ITEM_DISCOUNT_FIELD,
@@ -144,6 +145,18 @@ def create_sales_order(shopify_order, setting, company=None):
 
 		if company:
 			so.update({"company": company, "status": "Draft"})
+
+		# B16: detect dropship — if any line is tagged ship-dropship, mark
+		# the SO so downstream (reporting, FedEx skip) can branch on a
+		# single field.
+		has_dropship = any(
+			item.get(ORDER_ITEM_SHIPPING_METHOD_FIELD) == "ship-dropship"
+			for item in items
+		)
+		so.update(
+			{ORDER_FULFILLMENT_SOURCE_FIELD: "dropship" if has_dropship else "warehouse"}
+		)
+
 		so.flags.ignore_mandatory = True
 		so.flags.shopiy_order_json = json.dumps(shopify_order)
 		so.save(ignore_permissions=True)
@@ -270,10 +283,12 @@ def _ensure_misc_manual_item(setting):
 
 
 def _resolve_shipping_method(shopify_item):
-	"""B7: Determine ship-sea or ship-air from the product's tags.
+	"""B7 + B16: Determine shipping method from the product's tags.
 
 	Looks up the ERPNext Item linked to this Shopify product and reads
-	the shopify_tags custom field. Returns 'ship-sea', 'ship-air', or ''.
+	the shopify_tags custom field.
+
+	Returns: 'ship-sea' | 'ship-air' | 'ship-dropship' | ''
 	"""
 	product_id = shopify_item.get("product_id")
 	if not product_id:
@@ -293,9 +308,13 @@ def _resolve_shipping_method(shopify_item):
 	tags = frappe.db.get_value("Item", erpnext_item_code, ITEM_TAGS_FIELD) or ""
 	tags_lower = tags.lower()
 
+	# B16: Order matters: ship-dropship > ship-sea > ship-air
+	# (dropship bypasses all other routing)
+	if "ship-dropship" in tags_lower:
+		return "ship-dropship"
 	if "ship-sea" in tags_lower:
 		return "ship-sea"
-	elif "ship-air" in tags_lower:
+	if "ship-air" in tags_lower:
 		return "ship-air"
 	return ""
 

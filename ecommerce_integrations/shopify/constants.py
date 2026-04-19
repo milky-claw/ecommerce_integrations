@@ -47,6 +47,7 @@ ORDER_FULFILLMENT_STATUS_FIELD = "shopify_fulfillment_status"
 ORDER_TIP_AMOUNT_FIELD = "shopify_tip_amount"
 ORDER_ITEM_PROPERTIES_FIELD = "shopify_line_item_properties"
 ORDER_ITEM_SHIPPING_METHOD_FIELD = "shopify_shipping_method"
+ORDER_FULFILLMENT_SOURCE_FIELD = "shopify_fulfillment_source"
 ITEM_TAGS_FIELD = "shopify_tags"
 ITEM_METAFIELDS_FIELD = "shopify_metafields"
 

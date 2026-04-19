@@ -1003,5 +1003,233 @@ class TestB15DiscountDollarAmount(unittest.TestCase):
         self.assertEqual(row["shopify_item_discount"], 33.33)
 
 
+# ── B16: ship-dropship + product_id fallback for SKU-less products ────
+#
+# 1. `get_item_code` previously required (sku OR variant_id) to match an
+#    Ecommerce Item. For SKU-less products where we maintain only a
+#    product-level mapping (single row with integration_item_code but no
+#    variant_id), lookups fell through to MISC-MANUAL. B16 adds a second
+#    attempt that filters on integration_item_code only, so every variant
+#    of a SKU-less product resolves to the parent item_code.
+# 2. `_resolve_shipping_method` returns 'ship-dropship' when the linked
+#    Item's tags include `ship-dropship` — bypassing ship-sea/ship-air
+#    routing. Priority is dropship > sea > air.
+# 3. `create_sales_order` sets `shopify_fulfillment_source` on the SO to
+#    'dropship' if any line resolved to ship-dropship, else 'warehouse'.
+#    Downstream FedEx skip / reporting can branch on a single field.
+
+
+def _resolve_shipping_method_from_tags_b16(tags_str):
+    """B16 version of the shipping-method resolver.
+
+    Dropship > sea > air priority."""
+    if not tags_str:
+        return ""
+    tags_lower = tags_str.lower()
+    if "ship-dropship" in tags_lower:
+        return "ship-dropship"
+    if "ship-sea" in tags_lower:
+        return "ship-sea"
+    if "ship-air" in tags_lower:
+        return "ship-air"
+    return ""
+
+
+def _get_item_code_b16(shopify_item, *, ecommerce_item_impl):
+    """B16 version of get_item_code.
+
+    Primary lookup uses (product_id, variant_id, sku). On miss, falls back
+    to product-level match (integration_item_code only, variant_id=None,
+    sku=None).
+    """
+    MODULE = "shopify"
+    item = ecommerce_item_impl.get_erpnext_item(
+        integration=MODULE,
+        integration_item_code=shopify_item.get("product_id"),
+        variant_id=shopify_item.get("variant_id"),
+        sku=shopify_item.get("sku"),
+    )
+    if item:
+        return item.item_code
+
+    # B16: product-level fallback
+    if shopify_item.get("product_id"):
+        item = ecommerce_item_impl.get_erpnext_item(
+            integration=MODULE,
+            integration_item_code=shopify_item.get("product_id"),
+            variant_id=None,
+            sku=None,
+        )
+        if item:
+            return item.item_code
+    return None
+
+
+def _compute_fulfillment_source_b16(line_items):
+    """B16 helper: inspect the rendered SO items list and return dropship
+    if any line has shipping_method == 'ship-dropship', else 'warehouse'.
+    """
+    SHIPPING_FIELD = "shopify_shipping_method"
+    has_dropship = any(
+        item.get(SHIPPING_FIELD) == "ship-dropship" for item in line_items
+    )
+    return "dropship" if has_dropship else "warehouse"
+
+
+class TestB16ProductIdFallback(unittest.TestCase):
+    """B16: SKU-less products resolve via product-level Ecommerce Item."""
+
+    def _fake_ecom(self, primary_return=None, fallback_return=None):
+        """Builds a mock that returns primary on first call, fallback on second."""
+        ecom = MagicMock()
+        ecom.get_erpnext_item = MagicMock(side_effect=[primary_return, fallback_return])
+        return ecom
+
+    def test_single_variant_no_sku_resolves_via_product_id(self):
+        """Single-variant no-SKU product: primary (by variant_id) misses,
+        fallback (by product_id only) hits."""
+        fallback_item = SimpleNamespace(item_code="DROPSHIP-AMT-PARENT")
+        ecom = self._fake_ecom(primary_return=None, fallback_return=fallback_item)
+        shopify_item = {"product_id": "9999", "variant_id": "111", "sku": None}
+
+        result = _get_item_code_b16(shopify_item, ecommerce_item_impl=ecom)
+        self.assertEqual(result, "DROPSHIP-AMT-PARENT")
+        # Verify both calls happened — primary (with variant_id) then fallback
+        self.assertEqual(ecom.get_erpnext_item.call_count, 2)
+        second_call_kwargs = ecom.get_erpnext_item.call_args_list[1].kwargs
+        self.assertEqual(second_call_kwargs["integration_item_code"], "9999")
+        self.assertIsNone(second_call_kwargs["variant_id"])
+        self.assertIsNone(second_call_kwargs["sku"])
+
+    def test_multi_variant_no_sku_all_resolve_to_parent(self):
+        """Multi-variant dropship: every variant shares one product-level
+        Ecommerce Item, so all resolve to the same parent item_code."""
+        parent_item = SimpleNamespace(item_code="DROPSHIP-AMT-PARENT")
+        resolved = []
+        for variant_id in ["v-100", "v-200", "v-300"]:
+            ecom = self._fake_ecom(primary_return=None, fallback_return=parent_item)
+            shopify_item = {"product_id": "9999", "variant_id": variant_id, "sku": None}
+            resolved.append(_get_item_code_b16(shopify_item, ecommerce_item_impl=ecom))
+        self.assertEqual(resolved, ["DROPSHIP-AMT-PARENT"] * 3)
+
+    def test_primary_match_still_wins_when_sku_matches(self):
+        """Existing SKU-matched products must NOT trigger the fallback
+        (i.e. primary lookup's result is returned, fallback never runs)."""
+        primary = SimpleNamespace(item_code="GH-WMP-0306")
+        ecom = MagicMock()
+        ecom.get_erpnext_item = MagicMock(return_value=primary)
+        shopify_item = {"product_id": "111", "variant_id": "222", "sku": "GH-WMP-0306"}
+
+        result = _get_item_code_b16(shopify_item, ecommerce_item_impl=ecom)
+        self.assertEqual(result, "GH-WMP-0306")
+        # Only one call — the primary
+        self.assertEqual(ecom.get_erpnext_item.call_count, 1)
+
+    def test_no_product_id_returns_none(self):
+        """If there's no product_id, fallback cannot run — returns None."""
+        ecom = MagicMock()
+        ecom.get_erpnext_item = MagicMock(return_value=None)
+        shopify_item = {"product_id": None, "variant_id": None, "sku": None}
+        result = _get_item_code_b16(shopify_item, ecommerce_item_impl=ecom)
+        self.assertIsNone(result)
+
+    def test_both_lookups_miss_returns_none(self):
+        """Both primary and fallback miss → None (caller uses MISC-MANUAL)."""
+        ecom = self._fake_ecom(primary_return=None, fallback_return=None)
+        shopify_item = {"product_id": "9999", "variant_id": "111", "sku": None}
+        result = _get_item_code_b16(shopify_item, ecommerce_item_impl=ecom)
+        self.assertIsNone(result)
+        self.assertEqual(ecom.get_erpnext_item.call_count, 2)
+
+
+class TestB16ShipDropshipDetection(unittest.TestCase):
+    """B16: Tag lookup returns ship-dropship when present."""
+
+    def test_dropship_only(self):
+        self.assertEqual(
+            _resolve_shipping_method_from_tags_b16("ship-dropship"),
+            "ship-dropship",
+        )
+
+    def test_dropship_among_other_tags(self):
+        self.assertEqual(
+            _resolve_shipping_method_from_tags_b16("Accessories, ship-dropship, stockv2"),
+            "ship-dropship",
+        )
+
+    def test_dropship_case_insensitive(self):
+        self.assertEqual(
+            _resolve_shipping_method_from_tags_b16("SHIP-DROPSHIP, Greenhouse"),
+            "ship-dropship",
+        )
+
+    def test_no_dropship_falls_back_to_sea(self):
+        self.assertEqual(
+            _resolve_shipping_method_from_tags_b16("ship-sea, Greenhouse"),
+            "ship-sea",
+        )
+
+
+class TestB16ShipDropshipPriority(unittest.TestCase):
+    """B16: ship-dropship beats ship-sea beats ship-air."""
+
+    def test_dropship_beats_sea(self):
+        self.assertEqual(
+            _resolve_shipping_method_from_tags_b16("ship-sea, ship-dropship"),
+            "ship-dropship",
+        )
+
+    def test_dropship_beats_air(self):
+        self.assertEqual(
+            _resolve_shipping_method_from_tags_b16("ship-air, ship-dropship"),
+            "ship-dropship",
+        )
+
+    def test_dropship_beats_both_sea_and_air(self):
+        self.assertEqual(
+            _resolve_shipping_method_from_tags_b16("ship-sea, ship-air, ship-dropship"),
+            "ship-dropship",
+        )
+
+    def test_sea_still_beats_air_when_no_dropship(self):
+        """Regression guard: the existing B7 sea>air priority must survive."""
+        self.assertEqual(
+            _resolve_shipping_method_from_tags_b16("ship-sea, ship-air"),
+            "ship-sea",
+        )
+
+
+class TestB16FulfillmentSourceField(unittest.TestCase):
+    """B16: SO's shopify_fulfillment_source is set from line-item shipping method."""
+
+    def test_any_dropship_line_marks_so_dropship(self):
+        items = [
+            {"shopify_shipping_method": "ship-sea"},
+            {"shopify_shipping_method": "ship-dropship"},
+        ]
+        self.assertEqual(_compute_fulfillment_source_b16(items), "dropship")
+
+    def test_all_dropship_lines_mark_so_dropship(self):
+        items = [
+            {"shopify_shipping_method": "ship-dropship"},
+            {"shopify_shipping_method": "ship-dropship"},
+        ]
+        self.assertEqual(_compute_fulfillment_source_b16(items), "dropship")
+
+    def test_no_dropship_lines_mark_so_warehouse(self):
+        items = [
+            {"shopify_shipping_method": "ship-sea"},
+            {"shopify_shipping_method": "ship-air"},
+        ]
+        self.assertEqual(_compute_fulfillment_source_b16(items), "warehouse")
+
+    def test_empty_items_default_to_warehouse(self):
+        self.assertEqual(_compute_fulfillment_source_b16([]), "warehouse")
+
+    def test_missing_shipping_method_defaults_to_warehouse(self):
+        items = [{}, {"shopify_shipping_method": ""}]
+        self.assertEqual(_compute_fulfillment_source_b16(items), "warehouse")
+
+
 if __name__ == "__main__":
     unittest.main()

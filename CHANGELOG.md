@@ -10,12 +10,41 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
-## [Unreleased] — pending deploy to bench-37067
+## [yei-v1.1.0] — 2026-04-19
 
-Commit `597356c` on `version-16`. Will be tagged `yei-v1.1.0` once deploy is confirmed Active.
+**Target bench:** bench-37067 (deploy candidate TBD — triggered via Press API)
+**Branch:** `version-16`
 
-### Changed
-- **B15 revision** (`597356c` supersedes `f140ffb`): set `rate == price_list_rate` to the same discounted-dollar value rather than using `discount_percentage`. Matches Shopify's dollar-amount discount model (no percentage conversion, no rounding). Root cause of #4344 isolated via direct save+submit test matrix: `rate=0` alone survives cleanly, but `rate=0 + price_list_rate=X>0` triggers ERPNext's reconciliation path. Fix short-circuits reconciliation because plr == rate. Per-unit discount audit preserved in `shopify_item_discount` custom field. 11 rewritten tests in `TestB15DiscountDollarAmount`, including the core invariant `test_rate_equals_price_list_rate_invariant` and explicit `test_no_percentage_conversion_no_rounding` using $33.33/$100. 66/66 total tests pass.
+Bundles the pending B15 revision (see `597356c`) with the new B16 patch below.
+
+### Added — B16: ship-dropship + product_id fallback for SKU-less products
+
+Enables the Stage 04c dropship workflow. Three coordinated changes:
+
+1. **`product.py — get_item_code` product-level fallback.** When the primary lookup `(integration, product_id, variant_id, sku)` misses, a second lookup runs with `variant_id=None, sku=None` — matching any Ecommerce Item row whose `integration_item_code` equals the Shopify product_id. Handles SKU-less catalog products (dropship items, draft products pending SKU assignment) where the fork maintains a product-level `product_id → representative item_code` mapping. Existing SKU matches are unchanged.
+2. **`order.py — _resolve_shipping_method` adds `ship-dropship`.** Reads `Item.shopify_tags`; if it contains `ship-dropship` the method returns `'ship-dropship'`, bypassing `ship-sea`/`ship-air`. Priority order: dropship > sea > air.
+3. **`order.py — create_sales_order` sets `shopify_fulfillment_source`.** After the SO dict is constructed, if any line's shipping method is `ship-dropship` the custom field is set to `'dropship'`, otherwise `'warehouse'`. Downstream consumers (the Stage 04d FedEx client, dropship reports) can branch on a single field instead of re-scanning line items.
+
+Added `ORDER_FULFILLMENT_SOURCE_FIELD = "shopify_fulfillment_source"` to `constants.py`.
+
+**Tests:** 4 new test classes (18 new tests) in `test_connector_patches.py`:
+- `TestB16ProductIdFallback` — single + multi-variant no-SKU resolution, primary-still-wins guard, both-miss → None
+- `TestB16ShipDropshipDetection` — dropship detection in various tag strings
+- `TestB16ShipDropshipPriority` — dropship > sea > air, plus sea > air regression guard
+- `TestB16FulfillmentSourceField` — SO field computed correctly from line-item shipping methods
+
+Total: 84/84 tests pass (was 66; +18 new).
+
+### Changed — B15 revision (from prior [Unreleased])
+- **B15 revision** (`597356c` supersedes `f140ffb`): set `rate == price_list_rate` to the same discounted-dollar value rather than using `discount_percentage`. Matches Shopify's dollar-amount discount model (no percentage conversion, no rounding). Root cause of #4344 isolated via direct save+submit test matrix: `rate=0` alone survives cleanly, but `rate=0 + price_list_rate=X>0` triggers ERPNext's reconciliation path. Fix short-circuits reconciliation because plr == rate. Per-unit discount audit preserved in `shopify_item_discount` custom field. 11 rewritten tests in `TestB15DiscountDollarAmount`, including the core invariant `test_rate_equals_price_list_rate_invariant` and explicit `test_no_percentage_conversion_no_rounding` using $33.33/$100.
+
+### Version bump
+- `__version__` in `ecommerce_integrations/__init__.py`: `1.17.0` → `1.1.0` (aligning with `yei-*` fork versioning scheme — previously left at upstream's `1.17.0` by oversight).
+
+### Risks / rollback
+- New fallback only fires if primary match fails → zero regression risk for existing SKU-matched products.
+- Rollback: revert the commit + rebuild bench. Dropship orders then fall back to `MISC-MANUAL` (the safe B12 default).
+- No data migration needed — fix is code-only.
 
 ### Known (not yet fixed in code)
 - `orders/edited` webhook was registered on Shopify out-of-band via Admin API (webhook id `1890513060203`) because the connector's `WEBHOOK_EVENTS` listed it but the 2026-04-17 HMAC re-registration helper somehow missed this one topic. Consider adding a defensive re-registration check in `connection.py` that reconciles Shopify's webhook list against `WEBHOOK_EVENTS` on startup.
