@@ -628,6 +628,83 @@ def _sync_tags_and_metafields(product_id, product_dict):
 		)
 
 
+def sync_product_from_webhook(payload, request_id=None):
+	"""B5: Handle products/create + products/update webhook events.
+
+	If the product is already mapped in Ecommerce Item (existing ERPNext
+	Items), just refresh `shopify_tags` on every linked Item — fast path,
+	DB-only. Otherwise fall through to the full creation pipeline.
+
+	B6 (metafields) intentionally NOT synced here — webhook payload doesn't
+	include metafields, and the parked B6 spec hasn't been scoped.
+	"""
+	frappe.set_user("Administrator")
+	frappe.flags.request_id = request_id
+
+	product_dict = payload
+	product_id = cstr(product_dict.get("id"))
+	if not product_id:
+		create_shopify_log(
+			status="Invalid",
+			message="products webhook payload missing id — skipped",
+		)
+		return
+
+	try:
+		action, linked_items = _resolve_product_sync_action(product_id)
+		tags = product_dict.get("tags", "") or ""
+
+		if action == "update_tags":
+			for item_code in linked_items:
+				frappe.db.set_value(
+					"Item",
+					item_code,
+					ITEM_TAGS_FIELD,
+					tags,
+					update_modified=False,
+				)
+			create_shopify_log(
+				status="Success",
+				message=(
+					f"B5 tag sync: product {product_id} → "
+					f"{len(linked_items)} Item(s) updated with tags={tags!r}"
+				),
+			)
+		else:
+			variants = product_dict.get("variants") or []
+			variant_id = variants[0].get("id") if variants else None
+			sku = variants[0].get("sku") if variants else None
+			product = ShopifyProduct(
+				product_id=product_id,
+				variant_id=variant_id,
+				sku=sku,
+			)
+			if not product.is_synced():
+				product.sync_product()
+			create_shopify_log(
+				status="Success",
+				message=f"B5 new product {product_id} synced via webhook",
+			)
+	except Exception as e:
+		create_shopify_log(status="Error", exception=e, rollback=True)
+
+
+def _resolve_product_sync_action(product_id):
+	"""B5: Decide whether a webhook should update tags on existing Items or
+	trigger a new ShopifyProduct.sync_product() flow.
+
+	Returns: ("update_tags", [erpnext_item_codes]) | ("create_new", [])
+	"""
+	linked = frappe.get_all(
+		"Ecommerce Item",
+		filters={"integration": MODULE_NAME, "integration_item_code": cstr(product_id)},
+		pluck="erpnext_item_code",
+	)
+	if linked:
+		return ("update_tags", linked)
+	return ("create_new", [])
+
+
 def write_upload_log(status: bool, product: Product, item, action="Created") -> None:
 	if not status:
 		msg = _("Failed to upload item to Shopify") + "<br>"

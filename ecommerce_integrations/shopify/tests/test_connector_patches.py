@@ -8,7 +8,9 @@ and verify the patched functions produce correct output.
 Run with: python3 -m pytest ecommerce_integrations/shopify/tests/test_connector_patches.py -v
 """
 
+import datetime
 import json
+import re
 import sys
 import unittest
 from types import SimpleNamespace
@@ -1229,6 +1231,442 @@ class TestB16FulfillmentSourceField(unittest.TestCase):
     def test_missing_shipping_method_defaults_to_warehouse(self):
         items = [{}, {"shopify_shipping_method": ""}]
         self.assertEqual(_compute_fulfillment_source_b16(items), "warehouse")
+
+
+# ── B5: product webhook handler — keep shopify_tags in sync ───────────
+#
+# Connector didn't subscribe to products/* webhooks, so tag changes after
+# product creation (client adds `ship-dropship` or `warranty` to an existing
+# product) never reached Item.shopify_tags. Fix: subscribe to products/create
+# + products/update, and on fire, refresh tags on every linked ERPNext Item
+# via Ecommerce Item → erpnext_item_code mapping. B6 (metafields) parked.
+
+def _resolve_product_sync_action_b5(product_id, ecom_lookup):
+    """Decide whether the webhook handler should update existing Item tags or
+    trigger a fresh ShopifyProduct.sync_product() flow.
+
+    ecom_lookup is a callable: (product_id_str) → list[erpnext_item_code].
+    Returns ("update_tags", [codes]) | ("create_new", []).
+    """
+    linked = ecom_lookup(str(product_id))
+    if linked:
+        return ("update_tags", linked)
+    return ("create_new", [])
+
+
+def _apply_tag_update_b5(linked_item_codes, tags_string, setter):
+    """Apply tag writes to every linked ERPNext Item.
+
+    setter is a callable: (item_code, field_name, value) → None.
+    Returns number of items updated.
+    """
+    for item_code in linked_item_codes:
+        setter(item_code, "shopify_tags", tags_string)
+    return len(linked_item_codes)
+
+
+class TestB5ProductWebhookDispatch(unittest.TestCase):
+    """B5: webhook handler picks update-tags vs create-new correctly."""
+
+    def test_mapped_product_updates_tags(self):
+        ecom = lambda pid: ["GH-WMP-0306", "GH-WMP-0306-small"]
+        action, items = _resolve_product_sync_action_b5("14712905695595", ecom)
+        self.assertEqual(action, "update_tags")
+        self.assertEqual(items, ["GH-WMP-0306", "GH-WMP-0306-small"])
+
+    def test_unmapped_product_creates_new(self):
+        ecom = lambda pid: []
+        action, items = _resolve_product_sync_action_b5("99999999", ecom)
+        self.assertEqual(action, "create_new")
+        self.assertEqual(items, [])
+
+    def test_product_id_coerced_to_string(self):
+        """Shopify sends id as int, Ecommerce Item stores as string."""
+        calls = []
+        def ecom(pid):
+            calls.append(pid)
+            return ["ITEM-1"]
+        _resolve_product_sync_action_b5(14712905695595, ecom)
+        self.assertEqual(calls, ["14712905695595"])
+
+
+class TestB5TagUpdateApply(unittest.TestCase):
+    """B5: tag update walks every linked Item."""
+
+    def test_single_item_single_variant_product(self):
+        writes = []
+        setter = lambda ic, field, val: writes.append((ic, field, val))
+        count = _apply_tag_update_b5(
+            ["ACC-DRIP-SET-0400"], "ship-air, Accesories", setter
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(writes, [("ACC-DRIP-SET-0400", "shopify_tags", "ship-air, Accesories")])
+
+    def test_multi_variant_product_updates_all_linked_items(self):
+        writes = []
+        setter = lambda ic, field, val: writes.append((ic, field, val))
+        linked = ["AMT-CHR1-091X72-G", "AMT-CHR1-091X72-B", "AMT-CHR1-091X72-N"]
+        count = _apply_tag_update_b5(linked, "ship-dropship, stockv2", setter)
+        self.assertEqual(count, 3)
+        self.assertEqual([w[0] for w in writes], linked)
+        self.assertTrue(all(w[2] == "ship-dropship, stockv2" for w in writes))
+
+    def test_empty_tags_still_writes(self):
+        """Client deletes all tags → empty string must replace, not be skipped.
+        Otherwise stale tags would persist after client cleanup."""
+        writes = []
+        setter = lambda ic, field, val: writes.append((ic, field, val))
+        count = _apply_tag_update_b5(["GH-WMP-0306"], "", setter)
+        self.assertEqual(count, 1)
+        self.assertEqual(writes[0][2], "")
+
+    def test_no_linked_items_is_noop(self):
+        writes = []
+        setter = lambda ic, field, val: writes.append((ic, field, val))
+        count = _apply_tag_update_b5([], "ship-sea", setter)
+        self.assertEqual(count, 0)
+        self.assertEqual(writes, [])
+
+
+class TestB5WebhookEventsConstants(unittest.TestCase):
+    """B5: constants.py must subscribe to products/* webhooks."""
+
+    def test_webhook_events_include_products(self):
+        # Inline the expected entries — we're testing constant config, not
+        # importing constants.py directly (MagicMock'd at top of file).
+        required_events = {
+            "orders/create",
+            "orders/paid",
+            "orders/fulfilled",
+            "orders/cancelled",
+            "orders/partially_fulfilled",
+            "orders/edited",
+            "products/create",   # B5
+            "products/update",   # B5
+        }
+        # Read the actual constants.py to verify the config matches.
+        import os
+        const_path = os.path.join(SHOPIFY_DIR, "constants.py")
+        with open(const_path) as f:
+            source = f.read()
+        for ev in required_events:
+            self.assertIn(f'"{ev}"', source, f"missing event: {ev}")
+
+    def test_event_mapper_routes_products_to_handler(self):
+        import os
+        const_path = os.path.join(SHOPIFY_DIR, "constants.py")
+        with open(const_path) as f:
+            source = f.read()
+        for ev in ("products/create", "products/update"):
+            # Must map to the product webhook handler.
+            self.assertIn(
+                f'"{ev}": "ecommerce_integrations.shopify.product.sync_product_from_webhook"',
+                source,
+                f"{ev} not mapped to sync_product_from_webhook",
+            )
+
+
+# ── B17: SO delivery_date parsed from shipping_lines titles ───────────
+#
+# Connector currently sets delivery_date = created_at, so every Shopify SO
+# flags Overdue within 1-2 days. Fix: parse shipping_lines[].title for either
+# (a) business-day range "(X - Y business days)" → order_date + Y business
+# days, or (b) explicit "Estimated (to be Delivered|Delivery by) <Mon> <Day>".
+# Across multiple shipping_lines (mixed carts, preorder), take LATER date.
+# Fallback = order_date when nothing parses.
+#
+# Patterns observed live on #4395 (pre-order, 2 shipping_lines):
+#   "FREE Shipping (12 - 18 business days)"
+#   "FREE Shipping (Estimated to be Delivered  May 20)"
+# Also seen on backfill audit (50 recent SOs, 100% regex coverage):
+#   "PRIORITY Secured FedEx Shipping with Tracking (8 - 12 business days)"
+#   "Secured FedEx Shipping with Tracking (5 - 12 business days)"
+#   "Priority Handling (12 - 18 business days)"
+#   "Free Shipping (Estimated Delivery by May 20th)"
+#   "Free Shipping (4-7 Business Days)"
+
+_RE_BIZ_DAYS = re.compile(r'\((\d+)\s*-\s*(\d+)\s+business days\)', re.IGNORECASE)
+_RE_EXPLICIT_DATE = re.compile(
+    r'Estimated (?:to be Delivered|Delivery by)\s+([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?',
+    re.IGNORECASE,
+)
+
+
+def _add_business_days_b17(start_date, days):
+    """Add N business days (Mon-Fri) to a date, skipping Sat/Sun."""
+    current = start_date
+    added = 0
+    while added < days:
+        current = current + datetime.timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current
+
+
+def _parse_month_day_b17(month_str, day_str, order_year):
+    """Parse 'May 20' (or 'January 5') to a date in the given year.
+
+    Tries full and abbreviated month names. Returns None if unparseable.
+    """
+    for fmt in ("%B %d %Y", "%b %d %Y"):
+        try:
+            return datetime.datetime.strptime(
+                f"{month_str} {day_str} {order_year}", fmt
+            ).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _resolve_delivery_date_b17(shopify_order, fallback):
+    """B17: delivery_date from shipping_lines titles.
+
+    Returns `fallback` (typically order_date) if nothing parses.
+    """
+    created_at = (shopify_order.get("created_at") or "")[:10]
+    try:
+        order_date = datetime.datetime.strptime(created_at, "%Y-%m-%d").date()
+    except ValueError:
+        return fallback
+
+    candidates = []
+    for line in shopify_order.get("shipping_lines") or []:
+        title = line.get("title") or ""
+
+        m_biz = _RE_BIZ_DAYS.search(title)
+        if m_biz:
+            upper_days = int(m_biz.group(2))
+            candidates.append(_add_business_days_b17(order_date, upper_days))
+            continue
+
+        m_date = _RE_EXPLICIT_DATE.search(title)
+        if m_date:
+            d = _parse_month_day_b17(m_date.group(1), m_date.group(2), order_date.year)
+            if d is None:
+                continue
+            # If parsed date is before order date, assume next year (Dec → Jan).
+            if d < order_date:
+                d = d.replace(year=order_date.year + 1)
+            candidates.append(d)
+
+    if candidates:
+        return max(candidates)
+    return fallback
+
+
+class TestB17DeliveryDate(unittest.TestCase):
+    _ORDER_DATE = datetime.date(2026, 4, 19)  # a Sunday
+    _ORDER = {"created_at": "2026-04-19T15:00:00Z"}
+
+    def _with_lines(self, *titles):
+        return {**self._ORDER, "shipping_lines": [{"title": t} for t in titles]}
+
+    def test_business_days_range_uses_upper_bound(self):
+        # 2026-04-19 (Sun) + 18 business days → 2026-05-13 (Wed)
+        order = self._with_lines("FREE Shipping (12 - 18 business days)")
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        self.assertEqual(result, datetime.date(2026, 5, 13))
+
+    def test_priority_secured_fedex_8_to_12_days(self):
+        # 2026-04-19 (Sun) + 12 business days → 2026-05-05 (Tue)
+        order = self._with_lines("PRIORITY Secured FedEx Shipping with Tracking (8 - 12 business days)")
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        self.assertEqual(result, datetime.date(2026, 5, 5))
+
+    def test_case_insensitive_business_days(self):
+        # "Business Days" vs "business days"
+        order = self._with_lines("Free Shipping (4-7 Business Days)")
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        # 2026-04-19 (Sun) + 7 business days → 2026-04-28 (Tue)
+        self.assertEqual(result, datetime.date(2026, 4, 28))
+
+    def test_explicit_date_standard_phrasing(self):
+        order = self._with_lines("FREE Shipping (Estimated to be Delivered May 20)")
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        self.assertEqual(result, datetime.date(2026, 5, 20))
+
+    def test_explicit_date_alt_phrasing_with_ordinal(self):
+        order = self._with_lines("Free Shipping (Estimated Delivery by May 20th)")
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        self.assertEqual(result, datetime.date(2026, 5, 20))
+
+    def test_mixed_cart_takes_later_of_lines(self):
+        # Same shape as live #4395: one bizdays line + one explicit preorder line.
+        order = self._with_lines(
+            "FREE Shipping (12 - 18 business days)",
+            "FREE Shipping (Estimated to be Delivered May 20)",
+        )
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        # 5-13 (biz) vs 5-20 (explicit) → max = 5-20
+        self.assertEqual(result, datetime.date(2026, 5, 20))
+
+    def test_year_rollover_for_dec_order_to_jan_delivery(self):
+        dec_order = {"created_at": "2025-12-20T10:00:00Z"}
+        dec_order["shipping_lines"] = [{"title": "FREE Shipping (Estimated Delivery by January 5th)"}]
+        fallback = datetime.date(2025, 12, 20)
+        result = _resolve_delivery_date_b17(dec_order, fallback=fallback)
+        self.assertEqual(result, datetime.date(2026, 1, 5))
+
+    def test_no_shipping_lines_returns_fallback(self):
+        result = _resolve_delivery_date_b17({"created_at": "2026-04-19T15:00:00Z"}, fallback=self._ORDER_DATE)
+        self.assertEqual(result, self._ORDER_DATE)
+
+    def test_unparseable_title_returns_fallback(self):
+        order = self._with_lines("Some random shipping method")
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        self.assertEqual(result, self._ORDER_DATE)
+
+    def test_bogus_created_at_returns_fallback(self):
+        bogus = {
+            "created_at": "not-a-date",
+            "shipping_lines": [{"title": "FREE Shipping (12 - 18 business days)"}],
+        }
+        result = _resolve_delivery_date_b17(bogus, fallback=self._ORDER_DATE)
+        self.assertEqual(result, self._ORDER_DATE)
+
+    def test_full_month_name(self):
+        order = self._with_lines("Free Shipping (Estimated Delivery by November 15)")
+        # 2026-04-19 order → Nov 15 2026
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        self.assertEqual(result, datetime.date(2026, 11, 15))
+
+    def test_empty_shipping_line_skipped(self):
+        order = {
+            **self._ORDER,
+            "shipping_lines": [{"title": ""}, {"title": "FREE Shipping (12 - 18 business days)"}],
+        }
+        result = _resolve_delivery_date_b17(order, fallback=self._ORDER_DATE)
+        self.assertEqual(result, datetime.date(2026, 5, 13))
+
+
+# ── B19: SO name from Shopify order number (SH-YYYY-NNNNN) ────────────
+#
+# Fixes cross-platform lookup pain: SAL-ORD-2026-02333 has no relation to
+# Shopify #4395. Format: SH-{year-from-created_at}-{order_number zero-padded
+# to 5 digits}. Year-prefix allows order_number counter resets across years;
+# 5-digit pad covers > 10k orders/year (Shopify counter will exceed 5 digits
+# eventually — zfill degrades gracefully). Only applies to Shopify-sourced
+# SOs via connector; manual SOs keep SAL-ORD series.
+
+def _format_shopify_so_name_b19(shopify_order):
+    """B19: Build SO name from Shopify order dict. Returns None if malformed."""
+    order_number = shopify_order.get("order_number")
+    if order_number is None or order_number == "":
+        return None
+    try:
+        on_int = int(order_number)
+    except (ValueError, TypeError):
+        return None
+    created_at = shopify_order.get("created_at", "") or ""
+    year = created_at[:4] if len(created_at) >= 4 else ""
+    if not year.isdigit():
+        return None
+    return f"SH-{year}-{on_int:05d}"
+
+
+class TestB19Naming(unittest.TestCase):
+    def test_standard_format(self):
+        self.assertEqual(
+            _format_shopify_so_name_b19({"order_number": 4395, "created_at": "2026-04-19T15:23:00-04:00"}),
+            "SH-2026-04395",
+        )
+
+    def test_short_order_number_padded_to_five(self):
+        self.assertEqual(
+            _format_shopify_so_name_b19({"order_number": 42, "created_at": "2026-01-01T00:00:00Z"}),
+            "SH-2026-00042",
+        )
+
+    def test_five_digit_number_fits(self):
+        self.assertEqual(
+            _format_shopify_so_name_b19({"order_number": 12345, "created_at": "2026-06-15T12:00:00Z"}),
+            "SH-2026-12345",
+        )
+
+    def test_over_hundred_thousand_still_works(self):
+        # Graceful overflow — zfill pads, doesn't truncate.
+        self.assertEqual(
+            _format_shopify_so_name_b19({"order_number": 100000, "created_at": "2027-01-01T00:00:00Z"}),
+            "SH-2027-100000",
+        )
+
+    def test_string_order_number_coerced(self):
+        self.assertEqual(
+            _format_shopify_so_name_b19({"order_number": "4395", "created_at": "2026-04-19T15:00:00Z"}),
+            "SH-2026-04395",
+        )
+
+    def test_year_from_created_at_not_sync_time(self):
+        # Order placed Dec 31 2025, year prefix must be 2025 not the current year.
+        self.assertEqual(
+            _format_shopify_so_name_b19({"order_number": 9999, "created_at": "2025-12-31T23:59:59Z"}),
+            "SH-2025-09999",
+        )
+
+    def test_missing_order_number_returns_none(self):
+        self.assertIsNone(_format_shopify_so_name_b19({"created_at": "2026-04-19T15:00:00Z"}))
+
+    def test_missing_created_at_returns_none(self):
+        self.assertIsNone(_format_shopify_so_name_b19({"order_number": 4395}))
+
+    def test_bogus_created_at_returns_none(self):
+        self.assertIsNone(_format_shopify_so_name_b19({"order_number": 4395, "created_at": "not-a-date"}))
+
+    def test_zero_order_number_pads_zeros(self):
+        # Edge: Shopify counter never at 0 in practice, but if it ever was,
+        # we produce SH-YYYY-00000 rather than crashing.
+        self.assertEqual(
+            _format_shopify_so_name_b19({"order_number": 0, "created_at": "2026-04-19T00:00:00Z"}),
+            "SH-2026-00000",
+        )
+
+
+# ── B18: SO currency from Shopify order ──────────────────────────────
+#
+# Connector was writing Shopify USD order totals into SO with currency=EUR +
+# conversion_rate=1.0 → every US order overvalued ~8-9% on the books.
+# Fix (per user 2026-04-20): set SO.currency = shopify_order.currency verbatim
+# and leave conversion_rate unset so ERPNext applies current FX at Sales Invoice
+# time. Just a currency copy — no conversion math in the connector.
+
+def _resolve_currency_b18(shopify_order):
+    """Return the Shopify order's currency code, or None if missing.
+
+    Returning None causes caller to omit the currency field on SO creation,
+    letting ERPNext fall back to Customer/Company default. Explicit 'USD'
+    or 'EUR' etc. is used verbatim (uppercased, whitespace-trimmed).
+    """
+    c = shopify_order.get("currency")
+    if not c or not isinstance(c, str):
+        return None
+    c = c.strip().upper()
+    return c or None
+
+
+class TestB18Currency(unittest.TestCase):
+    def test_usd_present(self):
+        self.assertEqual(_resolve_currency_b18({"currency": "USD"}), "USD")
+
+    def test_eur_present(self):
+        self.assertEqual(_resolve_currency_b18({"currency": "EUR"}), "EUR")
+
+    def test_lowercase_normalized(self):
+        self.assertEqual(_resolve_currency_b18({"currency": "usd"}), "USD")
+
+    def test_whitespace_padded(self):
+        self.assertEqual(_resolve_currency_b18({"currency": "  USD  "}), "USD")
+
+    def test_missing_key(self):
+        self.assertIsNone(_resolve_currency_b18({}))
+
+    def test_empty_string(self):
+        self.assertIsNone(_resolve_currency_b18({"currency": ""}))
+
+    def test_none_value(self):
+        self.assertIsNone(_resolve_currency_b18({"currency": None}))
+
+    def test_non_string_ignored(self):
+        self.assertIsNone(_resolve_currency_b18({"currency": 123}))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,78 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.2.0] — 2026-04-20
+
+**Target bench:** bench-37067
+**Branch:** `version-16`
+
+Bundles 4 connector patches (B5, B17, B18, B19) into a single release per the Stage 04c TODO. Three of the four are pre-Kete onboarding blockers (SO name clarity, delivery_date sanity, product tag visibility on line routing). All share the same files and deploy cycle.
+
+### Added — B5: product webhooks (tag sync in real time)
+
+Connector previously subscribed only to order events — product tag changes on Shopify (adding `ship-dropship` / `warranty` / renaming `stockv1`→`stockv2` etc.) never reached `Item.shopify_tags`. Tags only flowed on first product sync via `create_items_if_not_exist`.
+
+1. **`constants.py — WEBHOOK_EVENTS` + `EVENT_MAPPER`** gain `products/create` and `products/update`, both routed to `ecommerce_integrations.shopify.product.sync_product_from_webhook`.
+2. **`product.py — sync_product_from_webhook`**: dispatches by Ecommerce Item existence. If the product is already mapped, just `frappe.db.set_value` on `Item.shopify_tags` for every linked ERPNext Item (fast path, DB-only, no Shopify API call). If unmapped, run the full `ShopifyProduct.sync_product()` create flow.
+3. **Backfill script** (post-deploy, separate artifact at workspace `scripts/repair/backfill_b5_item_tags.py`) populates tags on the 189 currently-unpopulated active Items in one paginated Shopify read + REST PUT per Item.
+
+B6 (metafields sync) stays parked — webhook payloads don't include metafields, and the mapping hasn't been scoped.
+
+**Post-deploy action:** re-register webhooks so Shopify subscribes to the two new topics. Same mechanism as the 2026-04-17 HMAC rotation.
+
+### Added — B17: SO `delivery_date` from shipping_lines title
+
+Connector was setting `delivery_date = created_at` on every Shopify SO, which flagged every order Overdue within 1–2 days. Fix: parse `shopify_order.shipping_lines[].title` for either of two shapes:
+
+- **Business-day range:** regex `\((\d+)\s*-\s*(\d+)\s+business days\)` (case-insensitive). Uses upper bound; adds that many business days to `order_date`, skipping Saturdays and Sundays.
+- **Explicit preorder date:** regex `Estimated (?:to be Delivered|Delivery by)\s+<Month>\s+<Day>(?:st|nd|rd|th)?` (case-insensitive, accepts full + abbreviated month names). If parsed date is before `order_date`, bumps year by 1 (handles Dec → Jan rollover).
+
+Across multiple `shipping_lines` (mixed carts, preorder + regular), picks the **LATER** resolved date. Falls back to `order_date` if nothing parses (preserves current behavior for that one SO; doesn't crash). Per-line `delivery_date` on `Sales Order Item` now matches the SO header.
+
+Coverage verified against 50 recent Shopify SOs — 100% regex match across all four shipping methods observed in the general profile (`FREE Shipping`, `Priority Handling`, `PRIORITY Secured FedEx Shipping with Tracking`, `Secured FedEx Shipping with Tracking`) + both preorder phrasings.
+
+### Added — B18: SO currency from Shopify order
+
+Was storing `currency=EUR, conversion_rate=1.0` for every order regardless of Shopify's actual currency (USD for the US store). Fix: set `SO.currency = shopify_order.currency` verbatim (uppercased, whitespace-stripped). If missing, omits the field so ERPNext's Customer/Company default kicks in.
+
+**`conversion_rate` intentionally not set** — ERPNext applies current FX at Sales Invoice creation time, which avoids stale rates baked into the SO.
+
+No backfill — existing SOs' currency mislabels are frozen; fix applies to new SOs going forward.
+
+### Added — B19: SO name = `SH-YYYY-NNNNN` for Shopify-sourced orders
+
+ERPNext SO name (`SAL-ORD-2026-02333`) had no relation to Shopify order number (`#4395`), making cross-platform lookup painful for the rep and orchestrator. Fix: rename to `SH-{year-from-created_at}-{order_number zero-padded to 5 digits}`.
+
+- Year from Shopify `created_at` (not sync time) so orders keep their year-prefix across year boundaries.
+- 5-digit pad covers >10k orders/year (Shopify's counter will exceed 5 digits eventually — zfill degrades gracefully, no truncation).
+- Rename is post-submit via `frappe.rename_doc(..., force=True, merge=False)`. Cascades into `Delivery Note Item.against_sales_order` and `Sales Invoice Item.sales_order` automatically. Non-fatal on failure — SO exists with default naming and the error logs to Frappe Error Log.
+- Non-Shopify SOs untouched; they keep `SAL-ORD-` naming from their own `naming_series`.
+
+**Backfill scope (post-deploy, separate artifact at `scripts/repair/backfill_b19_so_rename.py`):** Sales Orders `modified` in the last 7 days only (~100 SOs, 0 have linked Delivery Note / Sales Invoice rows per audit — rename cascade is safe). Older SOs keep their historical `SAL-ORD-` names.
+
+### Tests
+
+39 new tests across 4 classes; 123/123 total pass (was 84):
+- `TestB18Currency` (8) — USD/EUR present, case/whitespace normalization, missing/empty/None/non-string → None
+- `TestB19Naming` (10) — standard format, padding, year-from-created_at, string coercion, malformed data → None, overflow graceful
+- `TestB17DeliveryDate` (12) — business-day range (4/7/12/18), explicit date (standard + ordinal + alt phrasing), mixed-cart max, year rollover, full + abbreviated month names, no-match fallback, empty-line skip
+- `TestB5ProductWebhookDispatch` + `TestB5TagUpdateApply` + `TestB5WebhookEventsConstants` (9) — mapped→update_tags, unmapped→create_new, int-coerced product_id, multi-variant tag walk, empty-tags still writes (clears stale), constants subscription verified
+
+### Risks / rollback
+- **B5 webhook re-registration required post-deploy** — without it, Shopify won't send products/* events; tag sync stays dormant (no regression, just missing new capability).
+- **B19 rename failures are non-fatal** — SO persists under default naming + logs. Worst case: one confusing SO name, no data loss.
+- **B17 fallback = `order_date`** when regex misses → that one SO keeps Overdue flag (same as today), doesn't cascade.
+- **B18 missing currency → ERPNext default** → no worse than today.
+- Rollback: revert commit + rebuild bench. Backfill scripts are idempotent; their effects outlive the patch revert (and that's fine — data repair stays).
+
+### Known / not addressed
+- B6 (metafield sync) still parked; revisit after Kete meeting scopes which metafields matter.
+- HMAC validation still permissive (logs warning, accepts all) — tighten post-Kete stability.
+- Warehouse mapping still empty on `Shopify Setting`.
+- `orders/edited` webhook: still out-of-band registered (upstream issue from 2026-04-17); untouched here.
+
+---
+
 ## [yei-v1.1.0] — 2026-04-19
 
 **Target bench:** bench-37067 (deploy candidate TBD — triggered via Press API)
