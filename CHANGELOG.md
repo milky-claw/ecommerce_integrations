@@ -10,6 +10,52 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.2.1] — 2026-04-21
+
+**Target bench:** bench-37067
+**Branch:** `version-16`
+**Commit:** `cf32640`
+
+Bugfix release. Single patch (B20) addressing the f-020 regression introduced when yei-v1.2.0's `products/create` + `products/update` webhooks were registered on 2026-04-20T20:47Z.
+
+### Fixed — B20: `sync_product_from_webhook` must not create Items
+
+**Root cause.** yei-v1.2.0's `sync_product_from_webhook` kept a fallback "create_new" branch that, when a webhook fired for a product with no existing `Ecommerce Item` mapping, called `ShopifyProduct(...).sync_product()` to create ERPNext Items from scratch. That path runs `_create_item`, which sets `item_code = product_dict.get("item_code") or product_dict.get("id")`. For variant-bearing products the template hits `_match_sku_and_link_item` with `has_variant=True`, which short-circuits to `return False` (templates don't have SKUs), so the template's `item_code` defaults to `product_dict["id"]` — a Shopify numeric ID. For 2 draft products without SKUs, every variant also fell through to numeric-ID creation.
+
+**Impact.** 5 Shopify products (3 active, 2 draft) created 70 shadow ERPNext Items (5 templates + 65 variants) with numeric item_codes + 70 `Ecommerce Item` shadow mappings before the webhooks were disabled at 2026-04-21T08:30Z. Zero orders were placed against the duplicates (verified: 0 Sales Order Item refs across all 11 SOs in the window).
+
+**Fix.** `sync_product_from_webhook` is now tag-sync-only:
+
+1. If the product has linked `Ecommerce Item` rows → refresh `shopify_tags` on every linked ERPNext Item (unchanged B5 behavior).
+2. If the product is **not** mapped → emit `B20 skip: product <id> has no ERPNext mapping — webhook does not create Items (f-020 fix)` and return. The handler never instantiates `ShopifyProduct` or calls `.sync_product()`.
+
+**New-product promotion** now routes exclusively via:
+- **Order sync** — `create_items_if_not_exist` in `order.py`, which runs the B14 SKU-first resolver per line item and handles SKU match / product-level fallback correctly.
+- **Manual ERPNext Item creation** — stage-04b-style catalog import.
+
+This matches how we onboarded the Stage-04b catalog (184 Items, 18 BOMs, 52 prices) — orders + manual, never via webhook-triggered create.
+
+### Tests — source-invariant guards
+
+The regression reintroduced behavior that had previously been argued about (B14 deliberately dropped the `variant_of` guard from `_match_sku_and_link_item`); without a test, a future refactor could easily re-add the create path and re-create the regression. Two new test classes:
+
+- **`TestB20UnmappedProductSkipped`**: dispatch-logic tests. Unmapped → 0 tag writes, 1 skip log. Mapped → N tag writes, 1 success log. Isolated inline helper `_handle_webhook_branch_b20`.
+- **`TestB20SourceInvariant`**: reads `product.py` source, strips the docstring, asserts the handler body contains **no** `ShopifyProduct(` and **no** `.sync_product()` method call, and **does** contain the `B20 skip` log string. Explicitly guards against reintroduction of the f-020 regression vector by any future refactor.
+
+127/127 tests pass (123 baseline + 4 B20). Run: `python3 ecommerce_integrations/shopify/tests/test_connector_patches.py`.
+
+### Post-deploy actions (completed 2026-04-21)
+
+1. ✅ Re-registered the two products/* webhooks via Shopify Admin API (new IDs: `products/create`=`1892629905771`, `products/update`=`1892629938539`).
+2. ✅ Cleaned up the 70 duplicate ERPNext Items (disabled + renamed to `<code>-orphan-f020`, via `frappe.client.rename_doc` — variants first, templates last) + 70 shadow `Ecommerce Item` mappings deleted (snapshot retained at `/tmp/f020_ec_dupes_snapshot.json`).
+3. ✅ Verified behaviorally via ambient Shopify Log entries at 11:11:44Z-11:11:48Z showing the new B5 message format on 5 unrelated products — that string exists only in cf32640.
+
+### Known minor
+
+`__version__` in `ecommerce_integrations/__init__.py` was **not** bumped to `"1.2.1"` in this commit. The deployed code is at cf32640 (confirmed via behavioral log format), but `frappe.utils.change_log.get_versions` will continue to report `1.2.0` until the version string is updated. Cosmetic — fix in next commit.
+
+---
+
 ## [yei-v1.2.0] — 2026-04-20
 
 **Target bench:** bench-37067
