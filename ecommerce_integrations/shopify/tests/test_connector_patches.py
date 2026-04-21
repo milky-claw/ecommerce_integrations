@@ -1366,6 +1366,135 @@ class TestB5WebhookEventsConstants(unittest.TestCase):
             )
 
 
+# ── B20: products/* webhook must not create Items (f-020 fix) ─────────
+#
+# Regression 2026-04-20: yei-v1.2.0 registered products/create + products/update
+# webhooks (B5). The then-current `sync_product_from_webhook` fallback branch
+# called `ShopifyProduct.sync_product()`, which for variant-bearing products
+# built `item_code = product_dict["id"]` (a Shopify numeric ID) because
+# `_match_sku_and_link_item` short-circuits when `has_variant=True`. Result: 5
+# active products fanned out to 70 duplicate Items with numeric item_codes over
+# 7 hours before the webhooks were disabled. Fix: the products/* path is
+# tag-sync-only — unmapped products are logged and skipped. New products enter
+# ERPNext via order sync (B14-guarded) or manual Item creation.
+
+
+def _handle_webhook_branch_b20(action, linked_items, tags, tag_setter, log_writer):
+    """Handler dispatch logic extracted from sync_product_from_webhook.
+
+    action: "update_tags" | "create_new"
+    linked_items: list[str] of erpnext_item_codes
+    tags: str — comma-separated tags from webhook payload
+    tag_setter: callable (item_code, field_name, value) → None
+    log_writer: callable (status, message) → None
+
+    Contract: create_new branch MUST NOT create Items or call any Item-creation
+    function. It logs a skip and returns. This is B20's core invariant.
+    Returns the count of Items tag-updated (0 when skipped).
+    """
+    if action == "update_tags":
+        for item_code in linked_items:
+            tag_setter(item_code, "shopify_tags", tags)
+        log_writer("Success", f"B5 tag sync: {len(linked_items)} Item(s)")
+        return len(linked_items)
+    log_writer("Success", "B20 skip: no ERPNext mapping — Items not created")
+    return 0
+
+
+class TestB20UnmappedProductSkipped(unittest.TestCase):
+    """B20: unmapped product webhook must not create Items."""
+
+    def test_unmapped_product_does_not_invoke_item_creation(self):
+        """create_new branch writes a skip log, nothing else."""
+        tag_writes = []
+        logs = []
+        count = _handle_webhook_branch_b20(
+            action="create_new",
+            linked_items=[],
+            tags="ship-air, Accesories",
+            tag_setter=lambda ic, f, v: tag_writes.append((ic, f, v)),
+            log_writer=lambda s, m: logs.append((s, m)),
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(tag_writes, [], "No tag writes for unmapped product")
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0][0], "Success")
+        self.assertIn("B20 skip", logs[0][1])
+
+    def test_mapped_product_still_updates_tags(self):
+        """Regression guard: B5 happy path must keep working."""
+        tag_writes = []
+        logs = []
+        count = _handle_webhook_branch_b20(
+            action="update_tags",
+            linked_items=["SPY-FUL-0400", "SPY-FUL-0600"],
+            tags="ship-air, Greenhouse",
+            tag_setter=lambda ic, f, v: tag_writes.append((ic, f, v)),
+            log_writer=lambda s, m: logs.append((s, m)),
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(len(tag_writes), 2)
+        self.assertEqual(
+            [w[0] for w in tag_writes], ["SPY-FUL-0400", "SPY-FUL-0600"]
+        )
+        self.assertTrue(all(w[1] == "shopify_tags" for w in tag_writes))
+        self.assertTrue(all(w[2] == "ship-air, Greenhouse" for w in tag_writes))
+
+
+class TestB20SourceInvariant(unittest.TestCase):
+    """B20: read product.py source and assert create_new branch does not
+    call ShopifyProduct or sync_product. Guards against accidental
+    reintroduction of the f-020 regression."""
+
+    def _read_product_source(self):
+        import os
+        prod_path = os.path.join(SHOPIFY_DIR, "product.py")
+        with open(prod_path) as f:
+            return f.read()
+
+    def _executable_body(self, source):
+        """Return handler source with the docstring stripped (docstring
+        mentions the old code path for context; only the executable body
+        matters for the invariant)."""
+        start = source.index("def sync_product_from_webhook(")
+        end = source.index("\ndef ", start + 1)
+        body = source[start:end]
+        # Strip the triple-quoted docstring
+        dq_open = body.find('"""')
+        if dq_open >= 0:
+            dq_close = body.find('"""', dq_open + 3)
+            if dq_close >= 0:
+                body = body[:dq_open] + body[dq_close + 3:]
+        return body
+
+    def test_sync_product_from_webhook_does_not_construct_shopify_product(self):
+        """The handler must not instantiate ShopifyProduct() — that path led
+        to duplicate numeric-ID Items in the f-020 regression."""
+        body = self._executable_body(self._read_product_source())
+        self.assertNotIn(
+            "ShopifyProduct(",
+            body,
+            "sync_product_from_webhook must not instantiate ShopifyProduct "
+            "(f-020 regression: creates numeric-ID Items for variant-bearing products)",
+        )
+        self.assertNotIn(
+            ".sync_product()",
+            body,
+            "sync_product_from_webhook must not call .sync_product() — "
+            "new-product creation belongs on the orders/* path (B14-guarded)",
+        )
+
+    def test_create_new_branch_logs_skip(self):
+        """Asserts the skip log tag ('B20 skip') is present — ensures the
+        unmapped branch is explicit, not a silent drop."""
+        body = self._executable_body(self._read_product_source())
+        self.assertIn(
+            "B20 skip",
+            body,
+            "Unmapped-product branch must emit a 'B20 skip' log",
+        )
+
+
 # ── B17: SO delivery_date parsed from shipping_lines titles ───────────
 #
 # Connector currently sets delivery_date = created_at, so every Shopify SO

@@ -629,11 +629,25 @@ def _sync_tags_and_metafields(product_id, product_dict):
 
 
 def sync_product_from_webhook(payload, request_id=None):
-	"""B5: Handle products/create + products/update webhook events.
+	"""B5 + B20: Handle products/create + products/update webhook events.
 
-	If the product is already mapped in Ecommerce Item (existing ERPNext
-	Items), just refresh `shopify_tags` on every linked Item — fast path,
-	DB-only. Otherwise fall through to the full creation pipeline.
+	Tag-sync-only. When the product is already mapped via Ecommerce Item,
+	refresh `shopify_tags` on every linked ERPNext Item. When the product is
+	NOT mapped, skip silently — the products/* webhook must NEVER create new
+	ERPNext Items.
+
+	B20 rationale (f-020, 2026-04-20): the previous create-new branch called
+	`ShopifyProduct.sync_product()`, which builds `item_code` from
+	`product_dict["id"]` (Shopify numeric ID) when no explicit item_code is
+	set. For products with variants the template skips SKU matching entirely
+	(`_match_sku_and_link_item` returns False when `has_variant=True`),
+	producing duplicate numeric-ID Items for every product template. 70
+	duplicates were created overnight before the webhooks were disabled.
+
+	New-product promotion into ERPNext is handled via:
+	  (a) Order sync — `create_items_if_not_exist` runs the B14 SKU-first
+	      resolver per line item and links/creates correctly.
+	  (b) Manual ERPNext Item creation (stage-04b-style import).
 
 	B6 (metafields) intentionally NOT synced here — webhook payload doesn't
 	include metafields, and the parked B6 spec hasn't been scoped.
@@ -671,19 +685,13 @@ def sync_product_from_webhook(payload, request_id=None):
 				),
 			)
 		else:
-			variants = product_dict.get("variants") or []
-			variant_id = variants[0].get("id") if variants else None
-			sku = variants[0].get("sku") if variants else None
-			product = ShopifyProduct(
-				product_id=product_id,
-				variant_id=variant_id,
-				sku=sku,
-			)
-			if not product.is_synced():
-				product.sync_product()
 			create_shopify_log(
 				status="Success",
-				message=f"B5 new product {product_id} synced via webhook",
+				message=(
+					f"B20 skip: product {product_id} has no ERPNext mapping — "
+					f"webhook does not create Items (f-020 fix). "
+					f"Promote via order sync or manual Item creation."
+				),
 			)
 	except Exception as e:
 		create_shopify_log(status="Error", exception=e, rollback=True)
