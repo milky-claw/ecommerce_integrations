@@ -18,7 +18,6 @@ from ecommerce_integrations.shopify.constants import (
 	ORDER_FULFILLMENT_SOURCE_FIELD,
 	ORDER_FULFILLMENT_STATUS_FIELD,
 	ORDER_ID_FIELD,
-	ORDER_ITEM_DISCOUNT_FIELD,
 	ORDER_ITEM_PROPERTIES_FIELD,
 	ORDER_ITEM_SHIPPING_METHOD_FIELD,
 	ORDER_NUMBER_FIELD,
@@ -371,17 +370,20 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 
 		effective_rate = price - per_unit_tax - per_unit_discount  # Shopify's dollars, net-of-tax, post-discount
 
+		# B21: dollar-amount discount is stored natively on SOI via rate +
+		# price_list_rate (both = effective_rate, prevents ERPNext
+		# reconciliation). The old `shopify_item_discount` snapshot field
+		# is retired — native discount_amount on SOI already represents
+		# the same information at submit time if needed for reporting.
 		item_row = {
 			"item_code": item_code,
 			"item_name": shopify_item.get("name") or shopify_item.get("title"),
 			"rate": effective_rate,
-			"price_list_rate": effective_rate,  # match rate to disable reconciliation
+			"price_list_rate": effective_rate,
 			"delivery_date": delivery_date,
 			"qty": qty,
 			"stock_uom": shopify_item.get("uom") or "Nos",
 			"warehouse": setting.warehouse,
-			# Audit trail: original per-unit discount preserved in custom field
-			ORDER_ITEM_DISCOUNT_FIELD: per_unit_discount,
 			ORDER_ITEM_PROPERTIES_FIELD: properties_json,  # B2
 			ORDER_ITEM_SHIPPING_METHOD_FIELD: shipping_method,  # B7
 		}

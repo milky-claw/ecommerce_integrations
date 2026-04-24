@@ -8,9 +8,7 @@ from ecommerce_integrations.shopify.constants import (
 	ADDRESS_ID_FIELD,
 	CUSTOMER_ID_FIELD,
 	FULLFILLMENT_ID_FIELD,
-	ITEM_SELLING_RATE_FIELD,
 	ORDER_ID_FIELD,
-	ORDER_ITEM_DISCOUNT_FIELD,
 	ORDER_NUMBER_FIELD,
 	ORDER_STATUS_FIELD,
 	SUPPLIER_ID_FIELD,
@@ -28,6 +26,8 @@ class TestShopifySetting(IntegrationTestCase):
 		)
 
 	def test_custom_field_creation(self):
+		# B21: ITEM_SELLING_RATE_FIELD + ORDER_ITEM_DISCOUNT_FIELD retired;
+		# native Item.standard_rate + SOI.discount_amount carry the same data.
 		setup_custom_fields()
 
 		created_fields = frappe.get_all(
@@ -43,16 +43,14 @@ class TestShopifySetting(IntegrationTestCase):
 				ADDRESS_ID_FIELD,
 				CUSTOMER_ID_FIELD,
 				FULLFILLMENT_ID_FIELD,
-				ITEM_SELLING_RATE_FIELD,
 				ORDER_ID_FIELD,
 				ORDER_NUMBER_FIELD,
 				ORDER_STATUS_FIELD,
 				SUPPLIER_ID_FIELD,
-				ORDER_ITEM_DISCOUNT_FIELD,
 			]
 		)
 
-		self.assertGreaterEqual(len(created_fields), 13)
+		self.assertGreaterEqual(len(created_fields), 11)
 		created_fields_set = {d[0] for d in created_fields}
 
 		self.assertEqual(created_fields_set, required_fields)

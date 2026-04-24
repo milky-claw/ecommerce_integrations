@@ -10,6 +10,73 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.2.2] — 2026-04-24
+
+**Target bench:** bench-37067
+**Branch:** `version-16`
+**Commit:** _pending_
+
+Combined release:
+1. **B21** — close the f-027 regression vector (order-sync-path analogue of B20).
+2. **Native-field swaps** — retire two custom fields that duplicate native ERPNext slots (`Item.shopify_selling_rate` → native `Item.standard_rate`; `Sales Order Item.shopify_item_discount` → redundant with B15's native rate + price_list_rate).
+
+### Fixed — B21: order-sync path must never mint numeric-ID Items
+
+**Root cause.** B20 (yei-v1.2.1) closed the webhook-path vector for f-020, but the order-sync path was left open. `create_items_if_not_exist` → `ShopifyProduct.sync_product()` → `_make_item` still called `_create_item(..., has_variant=1)` for variant-bearing Shopify products, producing a templated ERPNext Item with `item_code = product_dict["id"]` (numeric Shopify product_id). `_match_sku_and_link_item` short-circuited on `has_variant=True`, so the template was never linked to an existing SKU and instead created a fresh numeric-ID Item.
+
+**Impact.** Item `6970914963546` (f-027) appeared on `2026-04-22 23:50:45Z` through this path — 26 hours after B20 deployed. One-instance, cosmetic orphan (no Sales Orders referenced it), but the vector remained live. Orchestrator flagged this for 2 days.
+
+**Fix.** Kete's flat-Item convention was never properly enforced — every Shopify variant should map 1:1 to a top-level ERPNext Item keyed by SKU, with no `has_variants=1` templates created by the connector. B21 removes the templated-Item code path entirely:
+
+- **Rewritten** `_make_item` as a per-variant loop that produces flat Items only. Variants with SKU → `_create_flat_variant` (new helper) → B14 SKU-match or new flat Item. Variants without SKU → explicit `B21 skip` log, manual Item creation required.
+- **Deleted** `_create_item_variants`, `_create_attribute`, `_set_new_attribute_values`, `_get_attribute_value` (four methods, ~100 LOC) — unreachable after the rewrite; this fork no longer uses ERPNext Item Attributes at all.
+- **Simplified** `_match_sku_and_link_item` — dropped `has_variant` and `variant_of` parameters since post-B21 it's always called with flat Items. Four-parameter signature becomes three.
+- **Added** `_guard_non_numeric_item_code(item_code, source)` — boundary helper at the top of `product.py` that raises `ValueError` if any future code path tries to create an Item with a pure-digit item_code. Called from `_create_flat_variant`. Defense-in-depth beyond the B21 rewrite — catches future regressions at the constructor boundary.
+
+### Swapped — `shopify_selling_rate` → native `Item.standard_rate`
+
+**Rationale.** `Item.standard_rate` is ERPNext's native "Default Selling Rate" field, already on every Item. The custom `shopify_selling_rate` was a parallel slot that yei never actually populated on this site (0 Items with shopify_selling_rate set at deploy time; 0 Items with standard_rate set). Swap is architecturally cleaner with zero data migration risk.
+
+**Changes:**
+- `product.py` — 4 read sites in `upload_erpnext_item` + `map_erpnext_variant_to_shopify_variant` swapped from `item.get(ITEM_SELLING_RATE_FIELD)` → `item.standard_rate` / `template_item.standard_rate`.
+- `shopify_setting.py::setup_custom_fields` — the Item block drops the `shopify_selling_rate` field install. `shopify_tags` now inserts after `standard_rate` directly.
+- `constants.py` — `ITEM_SELLING_RATE_FIELD` import removed from product.py + shopify_setting.py + test_shopify_setting.py. Constant retained in constants.py for now (no fork-external consumers).
+
+### Retired — `shopify_item_discount`
+
+**Rationale.** B15 (yei-v1.2.0) fixed discount handling to write both `rate` and `price_list_rate = effective_rate` on each Sales Order Item, so the discount is embedded in the native price fields (discount = list_rate_from_Shopify − effective_rate). The separate `shopify_item_discount` snapshot was redundant — a cache of data already present on the native SOI row. No operational system on `yourgreenhouses.frappe.cloud` reads this field (verified: 0 Print Formats, 0 Reports, 0 Dashboards, 0 Server Scripts, 0 Client Scripts reference it).
+
+**Changes:**
+- `order.py::get_order_items` — drop the `ORDER_ITEM_DISCOUNT_FIELD: per_unit_discount` write from the item row. Native `rate`/`price_list_rate` still set identically to B15.
+- `shopify_setting.py::setup_custom_fields` — the Sales Order Item block drops the `shopify_item_discount` field install. `shopify_line_item_properties` now inserts after `discount_and_margin` directly.
+- `constants.py` — `ORDER_ITEM_DISCOUNT_FIELD` import removed from order.py + shopify_setting.py + test_shopify_setting.py.
+
+### Tests
+
+New classes:
+- `TestB21GuardNonNumericItemCode` — 4 tests on the inline `_guard_non_numeric_item_code_b21` copy (matches the existing `_handle_webhook_branch_b20` / `_build_item_row` pattern — the harness mocks `ecommerce_integrations.shopify.product` wholesale, so we inline the helper for unit-test purposes).
+- `TestB21OrderSyncSourceInvariant` — 7 source-text tests reading `product.py`: asserts the templated-Item patterns are gone, `_create_item_variants` + attribute helpers are deleted, `_guard_non_numeric_item_code` exists + is invoked, no `"has_variants": 1,` literals, the simplified `_match_sku_and_link_item` signature is in place, `B21 skip` log-tag is present, and the native-swap points at `standard_rate`.
+- `TestB21OrderItemDiscountRetired` — 2 source-text tests reading `order.py`: `ORDER_ITEM_DISCOUNT_FIELD` no longer imported; the retired write line is absent.
+
+Updated tests:
+- `test_shopify_setting.py::test_custom_field_creation` — dropped the 2 retired field constants from the expected set; count threshold reduced from `>=13` to `>=11`.
+- `test_connector_patches.py::TestB15DiscountDollarAmount` — dropped 7 `assertEqual(row["shopify_item_discount"], ...)` assertions (native `rate` / `price_list_rate` assertions remain and fully validate the business logic).
+- `_build_item_row` inline helper — drops the `"shopify_item_discount": per_unit_discount` key from the returned dict.
+
+**Total: 141 tests pass.** Run: `python3 ecommerce_integrations/shopify/tests/test_connector_patches.py`.
+
+### Post-deploy actions (planned)
+
+1. Run one-shot cleanup: disable + rename `6970914963546` → `6970914963546-orphan-f027` and update the paired `Ecommerce Item` row. No data migration needed for the native-field swaps (0 populated rows for either field).
+2. Verify `frappe.db.count("Item", {"item_code": ["regexp", "^[0-9]+$"], "disabled": 0})` returns 0.
+3. Mark orchestrator finding `f-027` closed in `orchestrator/STATUS.md`.
+
+### Out of scope / deferred
+
+- Other native-field candidates surfaced by the [B21-NATIVE-FIELD-AUDIT](../ERPNext/stages/04c-data-sync/working/B21-NATIVE-FIELD-AUDIT.md) — `shopify_customer_id` / `address_id` / `supplier_id` / `metafields` / `financial_status` / `fulfillment_status` — all stay custom this release. A separate "native-first rebuild" will tackle platform-ownership + a generic `External Entity Map` doctype.
+
+---
+
 ## [yei-v1.2.1] — 2026-04-21
 
 **Target bench:** bench-37067

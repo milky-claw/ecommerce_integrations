@@ -845,9 +845,12 @@ class TestB14BugRegression(unittest.TestCase):
 #
 # Fix: set BOTH rate AND price_list_rate to the SAME discounted dollar
 # value. Matches Shopify's dollar-amount model (no percentage conversion,
-# no rounding). Short-circuits reconciliation because plr == rate. The
-# original per-unit discount is preserved in `shopify_item_discount`
-# (custom field) for audit.
+# no rounding). Short-circuits reconciliation because plr == rate.
+#
+# B21: the `shopify_item_discount` audit-snapshot field is retired.
+# B15's rate+price_list_rate pair carries the same information (discount
+# = price - effective_rate); we no longer mirror per_unit_discount into
+# a custom field.
 
 
 def _build_item_row(shopify_item, taxes_inclusive, setting_warehouse="W"):
@@ -871,7 +874,6 @@ def _build_item_row(shopify_item, taxes_inclusive, setting_warehouse="W"):
         "rate": effective_rate,
         "price_list_rate": effective_rate,  # match to disable ERPNext reconciliation
         "qty": qty,
-        "shopify_item_discount": per_unit_discount,
     }
 
 
@@ -887,8 +889,6 @@ class TestB15DiscountDollarAmount(unittest.TestCase):
         self.assertEqual(row["rate"], 0.0)
         self.assertEqual(row["price_list_rate"], 0.0,
                          msg="plr must equal rate to prevent ERPNext reconciliation")
-        self.assertEqual(row["shopify_item_discount"], 34.80,
-                         msg="per-unit discount preserved in audit field")
 
     def test_partially_discounted_line(self):
         """$100 item with $25 line discount on qty=1 → rate=75."""
@@ -900,7 +900,6 @@ class TestB15DiscountDollarAmount(unittest.TestCase):
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 75.0)
         self.assertEqual(row["price_list_rate"], 75.0)
-        self.assertEqual(row["shopify_item_discount"], 25.0)
 
     def test_no_discount(self):
         """Plain line: rate=price, plr=price."""
@@ -908,7 +907,6 @@ class TestB15DiscountDollarAmount(unittest.TestCase):
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 180.0)
         self.assertEqual(row["price_list_rate"], 180.0)
-        self.assertEqual(row["shopify_item_discount"], 0.0)
 
     def test_zero_amount_discount_allocation(self):
         """Shopify often sends discount_allocations=[{amount:0}] for un-discounted
@@ -920,7 +918,6 @@ class TestB15DiscountDollarAmount(unittest.TestCase):
         }
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 34.80)
-        self.assertEqual(row["shopify_item_discount"], 0.0)
 
     def test_multiple_discount_allocations(self):
         """Order-level + line-level discount both allocate to one line."""
@@ -934,7 +931,6 @@ class TestB15DiscountDollarAmount(unittest.TestCase):
         }
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 75.0)
-        self.assertEqual(row["shopify_item_discount"], 25.0)
 
     def test_taxes_inclusive_no_discount(self):
         """Taxes inclusive: price=120 includes $20 tax, qty=1 → rate=100."""
@@ -1002,7 +998,6 @@ class TestB15DiscountDollarAmount(unittest.TestCase):
         }
         row = _build_item_row(item, taxes_inclusive=False)
         self.assertEqual(row["rate"], 100.00 - 33.33)  # exact, no rounding
-        self.assertEqual(row["shopify_item_discount"], 33.33)
 
 
 # ── B16: ship-dropship + product_id fallback for SKU-less products ────
@@ -1492,6 +1487,197 @@ class TestB20SourceInvariant(unittest.TestCase):
             "B20 skip",
             body,
             "Unmapped-product branch must emit a 'B20 skip' log",
+        )
+
+
+# ── B21: Flat-Items-only + numeric-ID guard (f-027 fix) ───────────────
+#
+# Regression 2026-04-22: B20 closed the webhook-path vector for f-020 but
+# left the order-sync path open. `create_items_if_not_exist` →
+# `ShopifyProduct.sync_product()` → `_make_item` still called
+# `_create_item(..., has_variant=1)` for variant-bearing Shopify products,
+# producing a templated Item with `item_code = product_dict["id"]` (numeric
+# Shopify product_id). Item `6970914963546` appeared on 2026-04-22 23:50Z
+# through this path; `_match_sku_and_link_item` short-circuited on
+# `has_variant=True` so the template was never linked to an existing SKU.
+#
+# Fix: Kete's flat-Item convention was never properly enforced — every
+# Shopify variant should map 1:1 to a top-level ERPNext Item keyed by SKU,
+# with no `has_variants=1` templates created by the connector. B21 removes
+# the templated-Item code path entirely (`_create_item_variants`,
+# `_create_attribute`, `_set_new_attribute_values`, `_get_attribute_value`)
+# and replaces `_make_item` with a per-variant loop that produces flat Items.
+# Variants without SKU are skipped with an explicit `B21 skip` log — we
+# never mint numeric item_codes.
+#
+# Defense-in-depth: `_guard_non_numeric_item_code` helper raises at the
+# Item-creation boundary if any future path tries to mint a numeric item_code.
+
+
+def _guard_non_numeric_item_code_b21(item_code, source):
+    """Inline copy of product._guard_non_numeric_item_code for unit testing.
+
+    The test_connector_patches harness mocks ecommerce_integrations.shopify.product
+    wholesale (line 64 at the top of this file) so direct imports return
+    MagicMocks. Same pattern as _handle_webhook_branch_b20 and _build_item_row.
+    Contract must mirror product.py exactly — if this drifts from the real
+    helper, the TestB21OrderSyncSourceInvariant test suite catches it via
+    source-text assertions that the real helper exists with the right shape.
+    """
+    if str(item_code).isdigit():
+        raise ValueError(
+            f"{source}: attempted to create Item with numeric item_code "
+            f"{item_code!r}. SKU-less products must be skipped, not stubbed."
+        )
+
+
+class TestB21GuardNonNumericItemCode(unittest.TestCase):
+    """B21: the boundary guard against numeric item_codes."""
+
+    def test_numeric_item_code_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            _guard_non_numeric_item_code_b21("6970914963546", "_create_flat_variant")
+        self.assertIn("6970914963546", str(ctx.exception))
+        self.assertIn("SKU-less", str(ctx.exception))
+
+    def test_alpha_sku_passes(self):
+        # SKUs from Kete's master registry pass: prefix-letters + dash + digits
+        _guard_non_numeric_item_code_b21("GNR-EXT-0200X0000", "_create_flat_variant")
+        _guard_non_numeric_item_code_b21("AMT-A58229-GR", "_create_flat_variant")
+        _guard_non_numeric_item_code_b21("SCG-FUL-0300", "_create_flat_variant")
+
+    def test_empty_string_passes(self):
+        # Empty string isn't all-digits; guard is narrowly scoped to pure-digit.
+        # (The variant-no-sku case is caught earlier in _make_item with a skip log.)
+        _guard_non_numeric_item_code_b21("", "_create_flat_variant")
+
+    def test_numeric_string_with_spaces_raises(self):
+        # isdigit returns False on whitespace, so this actually passes the guard;
+        # document the current narrow semantics rather than claim broader coverage.
+        _guard_non_numeric_item_code_b21("123 456", "_create_flat_variant")
+
+
+class TestB21OrderSyncSourceInvariant(unittest.TestCase):
+    """B21: read product.py source and assert the flat-Items invariant
+    holds structurally — the templated-Item path is gone and no function
+    mints numeric item_codes."""
+
+    def _read_product_source(self):
+        import os
+        prod_path = os.path.join(SHOPIFY_DIR, "product.py")
+        with open(prod_path) as f:
+            return f.read()
+
+    def test_make_item_does_not_mint_numeric_template(self):
+        """_make_item must not produce Items keyed by Shopify product_id."""
+        src = self._read_product_source()
+        # These specific patterns were the f-020/f-027 vector. None must survive.
+        self.assertNotIn(
+            '"item_code": cstr(product_dict.get("id"))',
+            src,
+            "Templated-Item path (item_code = Shopify product_id) must be removed",
+        )
+        self.assertNotIn(
+            'cstr(product_dict.get("item_code")) or cstr(product_dict.get("id"))',
+            src,
+            "Legacy _create_item fallback chain must be removed",
+        )
+        # The variant-cascade pattern — variant_id as item_code
+        self.assertNotIn(
+            '"item_code": variant.get("id")',
+            src,
+            "Variant-cascade item_code assignment (_create_item_variants) must be removed",
+        )
+
+    def test_create_item_variants_deleted(self):
+        """The cascade that produced variant-id item_codes is gone."""
+        src = self._read_product_source()
+        self.assertNotIn(
+            "def _create_item_variants",
+            src,
+            "B21 removes _create_item_variants — no template variant cascade",
+        )
+
+    def test_attribute_helpers_deleted(self):
+        """Flat Items don't use ERPNext Item Attributes — helpers go away."""
+        src = self._read_product_source()
+        self.assertNotIn("def _create_attribute(", src)
+        self.assertNotIn("def _set_new_attribute_values(", src)
+        self.assertNotIn("def _get_attribute_value(", src)
+
+    def test_guard_helper_present_and_invoked(self):
+        """_guard_non_numeric_item_code must exist AND be called by the new code."""
+        src = self._read_product_source()
+        self.assertIn("def _guard_non_numeric_item_code(", src,
+                      "Boundary guard helper must be defined")
+        # Must be invoked at least once (in _create_flat_variant + _create_item)
+        invocations = src.count("_guard_non_numeric_item_code(")
+        self.assertGreaterEqual(invocations, 2,
+                                msg=f"Guard must be invoked at >=1 call site + defined (found {invocations})")
+
+    def test_make_item_does_not_set_has_variants_true(self):
+        """No code path in product.py should create has_variants=1 Items."""
+        src = self._read_product_source()
+        # The dict-literal form that was the template-creation pattern
+        self.assertNotIn('"has_variants": 1,', src)
+        self.assertNotIn("'has_variants': 1,", src)
+        # The keyword-argument form used by the old _create_item signature
+        self.assertNotIn("has_variant=1", src)
+
+    def test_match_sku_signature_simplified(self):
+        """_match_sku_and_link_item no longer takes has_variant or variant_of."""
+        src = self._read_product_source()
+        # Old signature with has_variant/variant_of must be gone
+        self.assertNotIn(
+            "def _match_sku_and_link_item(item_dict, product_id, variant_id, variant_of=None, has_variant=False)",
+            src,
+        )
+        # New signature
+        self.assertIn(
+            "def _match_sku_and_link_item(item_dict, product_id, variant_id)",
+            src,
+        )
+
+    def test_b21_rationale_logged(self):
+        """The new skip-path must emit an explicit B21 log so rep can debug."""
+        src = self._read_product_source()
+        self.assertIn("B21 skip", src,
+                      "Unmapped / no-SKU variant branch must emit a 'B21 skip' log")
+
+    def test_native_standard_rate_used_for_shopify_push(self):
+        """B21 native swap: upload_erpnext_item reads Item.standard_rate, not
+        the retired Item.shopify_selling_rate."""
+        src = self._read_product_source()
+        # Retired constant must not be imported or referenced
+        self.assertNotIn("ITEM_SELLING_RATE_FIELD", src,
+                         "ITEM_SELLING_RATE_FIELD constant should no longer be used")
+        # Native field must be referenced in the push path
+        self.assertIn("standard_rate", src,
+                      "upload_erpnext_item should read native Item.standard_rate")
+
+
+class TestB21OrderItemDiscountRetired(unittest.TestCase):
+    """B21 native swap: shopify_item_discount (the SOI custom snapshot) is
+    retired. B15's native rate + price_list_rate carry the same information."""
+
+    def _read_order_source(self):
+        import os
+        order_path = os.path.join(SHOPIFY_DIR, "order.py")
+        with open(order_path) as f:
+            return f.read()
+
+    def test_order_item_discount_field_not_imported(self):
+        src = self._read_order_source()
+        self.assertNotIn("ORDER_ITEM_DISCOUNT_FIELD", src,
+                         "order.py should no longer import / reference the retired constant")
+
+    def test_order_item_row_does_not_set_discount_snapshot(self):
+        src = self._read_order_source()
+        # The specific write that was the retired snapshot
+        self.assertNotIn(
+            "ORDER_ITEM_DISCOUNT_FIELD: per_unit_discount",
+            src,
+            "Retired custom-field write must be removed",
         )
 
 

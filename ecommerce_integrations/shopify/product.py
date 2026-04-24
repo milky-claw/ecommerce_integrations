@@ -11,7 +11,6 @@ from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import
 from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import (
 	ITEM_METAFIELDS_FIELD,
-	ITEM_SELLING_RATE_FIELD,
 	ITEM_TAGS_FIELD,
 	MODULE_NAME,
 	SETTING_DOCTYPE,
@@ -20,6 +19,21 @@ from ecommerce_integrations.shopify.constants import (
 	WEIGHT_TO_ERPNEXT_UOM_MAP,
 )
 from ecommerce_integrations.shopify.utils import create_shopify_log
+
+
+def _guard_non_numeric_item_code(item_code: str, source: str) -> None:
+	"""B21: item_code must never be a pure Shopify numeric ID.
+
+	Raises at the boundary so any future path that tries to mint a
+	numeric-ID Item fails fast. Defense-in-depth for f-020 / f-027
+	(templated-Item leakage). SKU-less products must be skipped with
+	an explicit B21 log, never stubbed with a numeric fallback.
+	"""
+	if str(item_code).isdigit():
+		raise ValueError(
+			f"{source}: attempted to create Item with numeric item_code "
+			f"{item_code!r}. SKU-less products must be skipped, not stubbed."
+		)
 
 
 class ShopifyProduct:
@@ -67,140 +81,83 @@ class ShopifyProduct:
 			_sync_tags_and_metafields(self.product_id, product_dict)
 
 	def _make_item(self, product_dict):
+		"""B21: Flat-Item convention. Shopify product templates are NEVER
+		imported as ERPNext Items. Each variant becomes a top-level Item
+		with item_code = variant.sku. B14 SKU-match handles existing
+		Items; unmapped SKUs create new flat Items with has_variants=0.
+		Variants without SKU are skipped with an explicit B21 log —
+		manual Item creation is required (numeric IDs forbidden).
+		"""
 		_add_weight_details(product_dict)
-
 		warehouse = self.setting.warehouse
 
-		if _has_variants(product_dict):
-			self.has_variants = 1
-			attributes = self._create_attribute(product_dict)
-			self._create_item(product_dict, warehouse, 1, attributes)
-			self._create_item_variants(product_dict, warehouse, attributes)
+		variants = product_dict.get("variants") or []
+		if not variants:
+			create_shopify_log(
+				status="Invalid",
+				message=f"B21 skip: product {product_dict.get('id')} has no variants",
+			)
+			return
 
+		for variant in variants:
+			sku = variant.get("sku")
+			if not sku:
+				create_shopify_log(
+					status="Success",
+					message=(
+						f"B21 skip: product {product_dict.get('id')} "
+						f"variant {variant.get('id')} has no SKU — "
+						f"manual Item creation required (numeric IDs forbidden)"
+					),
+				)
+				continue
+			self._create_flat_variant(product_dict, variant, warehouse)
+
+	def _create_flat_variant(self, product_dict, variant, warehouse):
+		"""B21: Create one flat ERPNext Item per Shopify variant with
+		item_code = variant.sku. Links to an existing Item via B14
+		SKU-match if one exists; otherwise creates a fresh flat Item
+		with has_variants=0. Never produces a numeric item_code — the
+		_guard_non_numeric_item_code boundary helper raises loudly if
+		anything tries."""
+		sku = variant["sku"]
+		_guard_non_numeric_item_code(sku, "_create_flat_variant")
+
+		title = product_dict.get("title", "").strip()
+		variant_title = (variant.get("title") or "").strip()
+		if variant_title and variant_title not in ("Default Title",):
+			item_name = f"{title} - {variant_title}"
 		else:
-			product_dict["variant_id"] = product_dict["variants"][0]["id"]
-			self._create_item(product_dict, warehouse)
+			item_name = title
 
-	def _create_attribute(self, product_dict):
-		attribute = []
-		for attr in product_dict.get("options"):
-			if not frappe.db.get_value("Item Attribute", attr.get("name"), "name"):
-				frappe.get_doc(
-					{
-						"doctype": "Item Attribute",
-						"attribute_name": attr.get("name"),
-						"item_attribute_values": [
-							{"attribute_value": attr_value, "abbr": attr_value}
-							for attr_value in attr.get("values")
-						],
-					}
-				).insert()
-				attribute.append({"attribute": attr.get("name")})
-
-			else:
-				# check for attribute values
-				item_attr = frappe.get_doc("Item Attribute", attr.get("name"))
-				if not item_attr.numeric_values:
-					self._set_new_attribute_values(item_attr, attr.get("values"))
-					item_attr.save()
-					attribute.append({"attribute": attr.get("name")})
-
-				else:
-					attribute.append(
-						{
-							"attribute": attr.get("name"),
-							"from_range": item_attr.get("from_range"),
-							"to_range": item_attr.get("to_range"),
-							"increment": item_attr.get("increment"),
-							"numeric_values": item_attr.get("numeric_values"),
-						}
-					)
-
-		return attribute
-
-	def _set_new_attribute_values(self, item_attr, values):
-		for attr_value in values:
-			if not any(
-				(d.abbr.lower() == attr_value.lower() or d.attribute_value.lower() == attr_value.lower())
-				for d in item_attr.item_attribute_values
-			):
-				item_attr.append("item_attribute_values", {"attribute_value": attr_value, "abbr": attr_value})
-
-	def _create_item(self, product_dict, warehouse, has_variant=0, attributes=None, variant_of=None):
 		item_dict = {
-			"variant_of": variant_of,
 			"is_stock_item": 1,
-			"item_code": cstr(product_dict.get("item_code")) or cstr(product_dict.get("id")),
-			"item_name": product_dict.get("title", "").strip(),
+			"item_code": sku,
+			"item_name": item_name,
 			"description": product_dict.get("body_html") or product_dict.get("title"),
 			"item_group": self._get_item_group(product_dict.get("product_type")),
-			"has_variants": has_variant,
-			"attributes": attributes or [],
-			"stock_uom": product_dict.get("uom") or _("Nos"),
-			"sku": product_dict.get("sku") or _get_sku(product_dict),
+			"has_variants": 0,
+			"stock_uom": _("Nos"),
+			"sku": sku,
 			"default_warehouse": warehouse,
 			"image": _get_item_image(product_dict),
-			"weight_uom": WEIGHT_TO_ERPNEXT_UOM_MAP[product_dict.get("weight_unit")],
-			"weight_per_unit": product_dict.get("weight"),
+			"weight_uom": WEIGHT_TO_ERPNEXT_UOM_MAP[variant.get("weight_unit")],
+			"weight_per_unit": variant.get("weight"),
 			"default_supplier": self._get_supplier(product_dict),
 		}
 
-		integration_item_code = product_dict["id"]  # shopify product_id
-		variant_id = product_dict.get("variant_id", "")  # shopify variant_id if has variants
-		sku = item_dict["sku"]
+		integration_item_code = product_dict["id"]
+		variant_id = variant.get("id")
 
-		if not _match_sku_and_link_item(
-			item_dict, integration_item_code, variant_id, variant_of=variant_of, has_variant=has_variant
-		):
+		if not _match_sku_and_link_item(item_dict, integration_item_code, variant_id):
 			ecommerce_item.create_ecommerce_item(
 				MODULE_NAME,
 				integration_item_code,
 				item_dict,
 				variant_id=variant_id,
 				sku=sku,
-				variant_of=variant_of,
-				has_variants=has_variant,
+				has_variants=0,
 			)
-
-	def _create_item_variants(self, product_dict, warehouse, attributes):
-		template_item = ecommerce_item.get_erpnext_item(
-			MODULE_NAME, integration_item_code=product_dict.get("id"), has_variants=1
-		)
-
-		if template_item:
-			for variant in product_dict.get("variants"):
-				shopify_item_variant = {
-					"id": product_dict.get("id"),
-					"variant_id": variant.get("id"),
-					"item_code": variant.get("id"),
-					"title": product_dict.get("title", "").strip() + "-" + variant.get("title"),
-					"product_type": product_dict.get("product_type"),
-					"sku": variant.get("sku"),
-					"uom": template_item.stock_uom or _("Nos"),
-					"item_price": variant.get("price"),
-					"weight_unit": variant.get("weight_unit"),
-					"weight": variant.get("weight"),
-				}
-
-				for i, variant_attr in enumerate(SHOPIFY_VARIANTS_ATTR_LIST):
-					if variant.get(variant_attr):
-						attributes[i].update(
-							{
-								"attribute_value": self._get_attribute_value(
-									variant.get(variant_attr), attributes[i]
-								)
-							}
-						)
-				self._create_item(shopify_item_variant, warehouse, 0, attributes, template_item.name)
-
-	def _get_attribute_value(self, variant_attr_val, attribute):
-		attribute_value = frappe.db.sql(
-			"""select attribute_value from `tabItem Attribute Value`
-			where parent = %s and (abbr = %s or attribute_value = %s)""",
-			(attribute["attribute"], variant_attr_val, variant_attr_val),
-			as_list=1,
-		)
-		return attribute_value[0][0] if len(attribute_value) > 0 else cint(variant_attr_val)
 
 	def _get_item_group(self, product_type=None):
 		parent_item_group = get_root_of("Item Group")
@@ -277,18 +234,15 @@ def _get_item_image(product_dict):
 	return None
 
 
-def _match_sku_and_link_item(item_dict, product_id, variant_id, variant_of=None, has_variant=False) -> bool:
-	"""Tries to match new item with existing item using Shopify SKU == item_code.
+def _match_sku_and_link_item(item_dict, product_id, variant_id) -> bool:
+	"""B14+B21: Link to an existing flat Item by SKU == item_code.
 
-	Returns true if matched and linked.
+	Always called with flat Items post-B21 (the templated-Item path was
+	removed). Returns True if an existing Item with item_code == sku was
+	found and a matching Ecommerce Item mapping was inserted.
 	"""
 	sku = item_dict["sku"]
-	# B14: do NOT skip when variant_of is set. ERPNext items may be flat
-	# (one Item per SKU, no template/variant structure) even when Shopify
-	# imports them under a template umbrella. Skipping on variant_of caused
-	# every Shopify variant to create a phantom Item named after variant_id
-	# and a self-pointing Ecommerce Item mapping.
-	if not sku or has_variant:
+	if not sku:
 		return False
 
 	item_name = frappe.db.get_value("Item", {"item_code": sku})
@@ -410,7 +364,7 @@ def upload_erpnext_item(doc, method=None):
 			update_default_variant_properties(
 				product,
 				sku=template_item.item_code,
-				price=template_item.get(ITEM_SELLING_RATE_FIELD),
+				price=template_item.standard_rate,
 				is_stock_item=template_item.is_stock_item,
 			)
 			if item.variant_of:
@@ -419,7 +373,7 @@ def upload_erpnext_item(doc, method=None):
 				variant_attributes = {
 					"title": template_item.item_name,
 					"sku": item.item_code,
-					"price": item.get(ITEM_SELLING_RATE_FIELD),
+					"price": item.standard_rate,
 				}
 				max_index_range = min(3, len(template_item.attributes))
 				for i in range(0, max_index_range):
@@ -467,10 +421,10 @@ def upload_erpnext_item(doc, method=None):
 				update_default_variant_properties(
 					product,
 					is_stock_item=template_item.is_stock_item,
-					price=item.get(ITEM_SELLING_RATE_FIELD),
+					price=item.standard_rate,
 				)
 			else:
-				variant_attributes = {"sku": item.item_code, "price": item.get(ITEM_SELLING_RATE_FIELD)}
+				variant_attributes = {"sku": item.item_code, "price": item.standard_rate}
 				product.options = []
 				max_index_range = min(3, len(template_item.attributes))
 				for i in range(0, max_index_range):

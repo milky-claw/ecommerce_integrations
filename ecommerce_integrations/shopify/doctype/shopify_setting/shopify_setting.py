@@ -19,13 +19,11 @@ from ecommerce_integrations.shopify.constants import (
 	CUSTOMER_ID_FIELD,
 	FULLFILLMENT_ID_FIELD,
 	ITEM_METAFIELDS_FIELD,
-	ITEM_SELLING_RATE_FIELD,
 	ITEM_TAGS_FIELD,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
 	ORDER_FULFILLMENT_STATUS_FIELD,
 	ORDER_ID_FIELD,
-	ORDER_ITEM_DISCOUNT_FIELD,
 	ORDER_ITEM_PROPERTIES_FIELD,
 	ORDER_ITEM_SHIPPING_METHOD_FIELD,
 	ORDER_NUMBER_FIELD,
@@ -265,18 +263,13 @@ class ShopifySetting(SettingController):
 
 def setup_custom_fields():
 	custom_fields = {
+		# B21: shopify_selling_rate retired — use native Item.standard_rate.
 		"Item": [
-			dict(
-				fieldname=ITEM_SELLING_RATE_FIELD,
-				label="Shopify Selling Rate",
-				fieldtype="Currency",
-				insert_after="standard_rate",
-			),
 			dict(
 				fieldname=ITEM_TAGS_FIELD,
 				label="Shopify Tags",
 				fieldtype="Small Text",
-				insert_after=ITEM_SELLING_RATE_FIELD,
+				insert_after="standard_rate",
 				read_only=1,
 				print_hide=1,
 			),
@@ -377,19 +370,15 @@ def setup_custom_fields():
 				print_hide=1,
 			),
 		],
+		# B21: shopify_item_discount retired — B15's native price_list_rate
+		# + rate = effective_rate (dollar-amount model) is the discount
+		# source of truth; the snapshot field was redundant.
 		"Sales Order Item": [
-			dict(
-				fieldname=ORDER_ITEM_DISCOUNT_FIELD,
-				label="Shopify Discount per unit",
-				fieldtype="Float",
-				insert_after="discount_and_margin",
-				read_only=1,
-			),
 			dict(
 				fieldname=ORDER_ITEM_PROPERTIES_FIELD,
 				label="Shopify Line Item Properties",
 				fieldtype="Long Text",
-				insert_after=ORDER_ITEM_DISCOUNT_FIELD,
+				insert_after="discount_and_margin",
 				read_only=1,
 				print_hide=1,
 			),
