@@ -1,5 +1,10 @@
 """B23: Shopify product-tag → freight class resolver.
 
+Module is pure-importable in test environments (no Frappe). The
+``@frappe.whitelist`` decorator on ``recompute_for_so`` falls back to
+a no-op when ``frappe`` isn't on sys.path so unit tests can still
+import the module.
+
 Maps line items to a freight class derived from the Shopify product's
 tags. Used at order sync time (real-time webhook + manual paths) to
 stamp ``Sales Order Item.shopify_freight_class`` per line and
@@ -20,6 +25,20 @@ Tag → class mapping (first match wins per line):
 Rollup semantics — see ``rollup_so``.
 """
 from __future__ import annotations
+
+try:
+	import frappe as _frappe
+	_whitelist = _frappe.whitelist
+except ImportError:
+	# Test environment — frappe not available. Decorator becomes no-op.
+	def _whitelist(*args, **kwargs):
+		def _wrap(fn):
+			return fn
+		# Support both `@_whitelist` and `@_whitelist()` forms.
+		if args and callable(args[0]):
+			return args[0]
+		return _wrap
+
 
 SHIP_TAG_TO_CLASS = {
 	"ship-air": "air",
@@ -106,6 +125,7 @@ def resolve_for_order(shopify_order, fetcher):
 	return per_line_classes, rollup_so(per_line_classes)
 
 
+@_whitelist()
 def recompute_for_so(so_name, fetcher=None):
 	"""Recompute & write shopify_freight_class for an existing Sales Order.
 

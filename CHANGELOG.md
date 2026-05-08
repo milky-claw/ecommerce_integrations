@@ -10,6 +10,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.2.5] — 2026-05-09
+
+**Hotfix on top of 1.2.4.** Two follow-ups:
+
+1. **`shopify_freight_class` fields gain `allow_on_submit=1`** on both `Sales Order` and `Sales Order Item`. 1.2.4 created them with default `allow_on_submit=0`, which blocked the workspace backfill from writing to already-submitted SOs (`UpdateAfterSubmitError: Not allowed to change Shopify Freight Class after submission`). Real-time webhook path was unaffected (writes to SO during draft state pre-submit). Patched in place via new `update_freight_class_allow_on_submit` migration that re-runs `setup_custom_fields()`.
+
+2. **`recompute_for_so` whitelisted** so workspace scripts can call it via REST. Same body as 1.2.4; just adds `@frappe.whitelist()` with a graceful no-op fallback when frappe isn't importable (test env). 35 unit tests still pass.
+
+`__version__` bumped 1.2.4 → 1.2.5.
+
 ## [yei-v1.2.4] — 2026-05-09
 
 **Target bench:** bench-37067

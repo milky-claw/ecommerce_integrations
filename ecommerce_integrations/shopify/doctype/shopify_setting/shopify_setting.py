@@ -374,6 +374,9 @@ def setup_custom_fields():
 			# `split` indicates the SO has both ship-air and ship-sea
 			# lines; the DN-split grouper materializes one DN per
 			# (manufacturer, freight_class) tuple in that case.
+			# allow_on_submit=1 — backfill + recompute_for_so write
+			# this on already-submitted SOs, and value can change if
+			# Shopify product gets retagged.
 			dict(
 				fieldname=FREIGHT_CLASS_FIELD,
 				label="Shopify Freight Class",
@@ -382,6 +385,7 @@ def setup_custom_fields():
 				insert_after=ORDER_TIP_AMOUNT_FIELD,
 				read_only=1,
 				print_hide=1,
+				allow_on_submit=1,
 			),
 		],
 		# B21: shopify_item_discount retired — B15's native price_list_rate
@@ -406,7 +410,9 @@ def setup_custom_fields():
 			),
 			# B23: per-line freight class derived live from Shopify product
 			# tags at sync time. Read by ygf split.py grouper to materialize
-			# DNs per (manufacturer, freight_class).
+			# DNs per (manufacturer, freight_class). allow_on_submit=1 —
+			# same rationale as the SO-level field; mass backfill writes
+			# on already-submitted SOs.
 			dict(
 				fieldname=FREIGHT_CLASS_FIELD,
 				label="Shopify Freight Class",
@@ -415,6 +421,7 @@ def setup_custom_fields():
 				insert_after=ORDER_ITEM_SHIPPING_METHOD_FIELD,
 				read_only=1,
 				print_hide=1,
+				allow_on_submit=1,
 			),
 		],
 		"Delivery Note": [
