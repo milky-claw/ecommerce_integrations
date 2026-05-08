@@ -13,6 +13,7 @@ from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import (
 	CUSTOMER_ID_FIELD,
 	EVENT_MAPPER,
+	FREIGHT_CLASS_FIELD,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
 	ORDER_FULFILLMENT_SOURCE_FIELD,
@@ -25,6 +26,10 @@ from ecommerce_integrations.shopify.constants import (
 	ORDER_TIP_AMOUNT_FIELD,
 	SETTING_DOCTYPE,
 	UNMATCHED_ITEM_CODE,
+)
+from ecommerce_integrations.shopify.freight_class import (
+	make_live_fetcher,
+	resolve_for_order,
 )
 from ecommerce_integrations.shopify.customer import ShopifyCustomer
 from ecommerce_integrations.shopify.product import create_items_if_not_exist, get_item_code
@@ -106,6 +111,17 @@ def create_sales_order(shopify_order, setting, company=None):
 			taxes_inclusive=shopify_order.get("taxes_included"),
 		)
 
+		# B23: stamp shopify_freight_class per line + SO-level rollup.
+		# Lives here (not in get_order_items) so the per-call product
+		# fetcher cache spans the whole order — duplicate product lines
+		# don't double-hit Shopify.
+		freight_per_line, freight_rollup = resolve_for_order(
+			{"line_items": line_items}, make_live_fetcher()
+		)
+		for idx, item_row in enumerate(items):
+			if idx < len(freight_per_line):
+				item_row[FREIGHT_CLASS_FIELD] = freight_per_line[idx]
+
 		if not items:
 			message = (
 				"Following items exists in the shopify order but relevant records were"
@@ -136,6 +152,7 @@ def create_sales_order(shopify_order, setting, company=None):
 			ORDER_FULFILLMENT_STATUS_FIELD: shopify_order.get("fulfillment_status") or "",  # B10
 			ORDER_DISCOUNT_CODES_FIELD: discount_code_names,  # B8
 			ORDER_TIP_AMOUNT_FIELD: tip_total,  # B9
+			FREIGHT_CLASS_FIELD: freight_rollup,  # B23
 			"customer": customer,
 			"transaction_date": order_date,
 			"delivery_date": delivery_date,  # B17

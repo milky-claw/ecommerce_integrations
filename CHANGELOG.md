@@ -10,6 +10,47 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.2.4] — 2026-05-09
+
+**Target bench:** bench-37067
+**Branch:** `version-16`
+**Deployed:** 2026-05-09 (pending — written ahead of deploy)
+
+### Added — B23: Shopify freight class on every SO + SO Item
+
+Pure metadata addition. New per-line + order-rollup field derived from the Shopify product's tags, computed live at sync time. Replaces the implicit, brittle dependency on `Item.shopify_tags` (which is stale for any Item not linked via `Ecommerce Item` — historically a long tail of legacy SKU-coded Items).
+
+**Why now.** ygf supplier-sheet writer (alpha51 era) reads `Item.shopify_tags` to drive Baumera-YGH col J highlighting. For the 18 Baumera greenhouse Items registered via master CSV import (no `Ecommerce Item` link), B5 product-update webhooks never reached them, so a 2025-Q4 Shopify retag from `ship-sea` to `ship-air` left the Item field stuck at `ship-sea`. Net effect: 59 Baumera-YGH rows show `ship-sea` in col J today even though their Shopify products are tagged `ship-air`. Stamping a per-line classification on the SO at sync time, sourced live from `Product.tags`, eliminates the staleness vector entirely.
+
+**New fields** (Custom Field, idempotent setup via `add_shopify_freight_class` patch):
+
+| Doctype | Fieldname | Type | Options |
+|---|---|---|---|
+| Sales Order Item | `shopify_freight_class` | Select | `air` \| `sea` \| `dropship` \| `""` |
+| Sales Order | `shopify_freight_class` | Select | `air` \| `sea` \| `dropship` \| `split` \| `""` |
+
+`split` (SO-level only) signals that an order has both `air` and `sea` lines — used by the ygf DN-split grouper (alpha52, separate release) to materialize one DN per `(manufacturer, freight_class)` tuple.
+
+**New module** `ecommerce_integrations/shopify/freight_class.py`:
+
+- `classify_product_tags(tags) -> str` — pure mapper, first matching `ship-*` tag wins. Tested across list/string/None/case/whitespace inputs.
+- `rollup_so(line_classes) -> str` — aggregates per-line classes to the SO-level value. `air`+`sea` ⇒ `split`; `air`+`dropship` ⇒ `air` (dropship lines skip DN, so the operational class is what's left); all-blank ⇒ `""`.
+- `resolve_for_order(order, fetcher)` — loops the order's `line_items[].product_id`, calls the fetcher, returns `(per_line_classes, rollup)`. Pure — caller supplies the fetcher (testable without Shopify API).
+- `make_live_fetcher()` — Shopify-API-backed fetcher with a per-call cache so multi-line orders don't double-hit the API for the same product.
+- `recompute_for_so(so_name)` — admin/recovery entry point. Re-fetches the original Shopify order via stored `shopify_order_id`, re-classifies every line, writes through `frappe.db.set_value` (no doc reload, no version bump). Independent of `Ecommerce Item` linkage state — used by the workspace backfill script for the existing ~2k SOs.
+
+**Hook** in [`order.py::create_sales_order`](https://github.com/milky-claw/ecommerce_integrations/blob/version-16/ecommerce_integrations/shopify/order.py): after `get_order_items` returns, call `resolve_for_order(...)` once with a fresh fetcher (cache scopes to one order), stamp `shopify_freight_class` on every items dict, set the SO-level rollup on `so_dict`. Real-time webhook path covered; manual paths (workspace `scripts/backfill_orders.py`, ad-hoc fixes) call `recompute_for_so(so_name)` for the same effect.
+
+**Tests** — 35 new in `test_freight_class.py`:
+- `TestClassifyProductTags` (12) — single tags, lists, case/whitespace, unknown tags, first-match-wins
+- `TestRollupSo` (13) — uniform/mixed/with-blanks/with-dropship/all-blank
+- `TestResolveForOrder` (8) — air-only, sea-only, split, dropship, missing product_id, fetcher-throws, empty payload
+- `TestLiveFetcherCaching` (1) — cache hit semantics with a mocked Shopify SDK
+
+**Compat:** purely additive. The older `_resolve_shipping_method` (B7) → `Sales Order Item.shopify_shipping_method` Data field remains unchanged for back-compat; downstream consumers can migrate to `shopify_freight_class` at their own pace.
+
+`__version__` bumped 1.2.3 → 1.2.4.
+
 ## [yei-v1.2.3] — 2026-05-08
 
 **Target bench:** bench-37067

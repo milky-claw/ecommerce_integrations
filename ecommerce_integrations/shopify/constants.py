@@ -57,6 +57,10 @@ ORDER_FULFILLMENT_SOURCE_FIELD = "shopify_fulfillment_source"
 ITEM_TAGS_FIELD = "shopify_tags"
 ITEM_METAFIELDS_FIELD = "shopify_metafields"
 
+# B23: per-line + SO-level freight class derived from Shopify product tags.
+# Same fieldname on both doctypes (different specs — see setup_custom_fields).
+FREIGHT_CLASS_FIELD = "shopify_freight_class"
+
 UNMATCHED_ITEM_CODE = "MISC-MANUAL"
 
 # ERPNext already defines the default UOMs from Shopify but names are different

@@ -17,6 +17,7 @@ from ecommerce_integrations.shopify import connection
 from ecommerce_integrations.shopify.constants import (
 	ADDRESS_ID_FIELD,
 	CUSTOMER_ID_FIELD,
+	FREIGHT_CLASS_FIELD,
 	FULLFILLMENT_ID_FIELD,
 	ITEM_METAFIELDS_FIELD,
 	ITEM_TAGS_FIELD,
@@ -369,6 +370,19 @@ def setup_custom_fields():
 				read_only=1,
 				print_hide=1,
 			),
+			# B23: SO-level rollup of per-line freight classes.
+			# `split` indicates the SO has both ship-air and ship-sea
+			# lines; the DN-split grouper materializes one DN per
+			# (manufacturer, freight_class) tuple in that case.
+			dict(
+				fieldname=FREIGHT_CLASS_FIELD,
+				label="Shopify Freight Class",
+				fieldtype="Select",
+				options="\nair\nsea\ndropship\nsplit",
+				insert_after=ORDER_TIP_AMOUNT_FIELD,
+				read_only=1,
+				print_hide=1,
+			),
 		],
 		# B21: shopify_item_discount retired — B15's native price_list_rate
 		# + rate = effective_rate (dollar-amount model) is the discount
@@ -387,6 +401,18 @@ def setup_custom_fields():
 				label="Shopify Shipping Method",
 				fieldtype="Data",
 				insert_after=ORDER_ITEM_PROPERTIES_FIELD,
+				read_only=1,
+				print_hide=1,
+			),
+			# B23: per-line freight class derived live from Shopify product
+			# tags at sync time. Read by ygf split.py grouper to materialize
+			# DNs per (manufacturer, freight_class).
+			dict(
+				fieldname=FREIGHT_CLASS_FIELD,
+				label="Shopify Freight Class",
+				fieldtype="Select",
+				options="\nair\nsea\ndropship",
+				insert_after=ORDER_ITEM_SHIPPING_METHOD_FIELD,
 				read_only=1,
 				print_hide=1,
 			),
