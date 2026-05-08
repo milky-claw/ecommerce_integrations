@@ -118,6 +118,66 @@ class TestProduct(TestCase):
 		)
 
 
+class TestCreateItemsIfNotExist(TestCase):
+	"""B22 — null-product_id guard regression tests."""
+
+	def test_skips_null_product_id_lines(self):
+		"""FREE-GIFT / MISC-MANUAL line items have null product_id; the
+		whole-order item-sync must not crash, and lines with valid
+		product_id in the same order must still attempt sync."""
+		from unittest.mock import patch
+		from ecommerce_integrations.shopify.product import create_items_if_not_exist
+
+		order = {
+			"line_items": [
+				{"product_id": None, "sku": "FREE-GIFT", "variant_id": None},
+				{"product_id": "", "sku": "MISC-MANUAL"},
+				{"product_id": "6732194021530", "variant_id": "39933951901850", "sku": "REAL-1"},
+			],
+		}
+
+		seen: list[str] = []
+
+		class FakeProduct:
+			def __init__(self, product_id, variant_id=None, sku=None):
+				seen.append(str(product_id))
+				self.product_id = product_id
+
+			def is_synced(self):
+				return True  # short-circuit; we only verify call shape
+
+			def sync_product(self):
+				pass  # not reached because is_synced=True
+
+		with patch("ecommerce_integrations.shopify.product.ShopifyProduct", FakeProduct):
+			create_items_if_not_exist(order)
+
+		# Only the real-product line should reach ShopifyProduct(...).
+		assert seen == ["6732194021530"], (
+			f"expected one synced product (the real one), got {seen}"
+		)
+
+	def test_missing_product_id_key_does_not_raise(self):
+		"""Line item dicts with NO product_id key at all (a separate
+		Shopify shape) must also be skipped without crashing."""
+		from unittest.mock import patch
+		from ecommerce_integrations.shopify.product import create_items_if_not_exist
+
+		order = {"line_items": [{"sku": "ANON", "variant_id": None}]}
+
+		called: list[str] = []
+
+		class FakeProduct:
+			def __init__(self, *a, **kw):
+				called.append("ctor")
+			def is_synced(self):
+				return True
+
+		with patch("ecommerce_integrations.shopify.product.ShopifyProduct", FakeProduct):
+			create_items_if_not_exist(order)
+		assert called == [], "ShopifyProduct must not be constructed for null-product_id lines"
+
+
 def create_item_attributes():
 	if not frappe.db.exists("Item Attribute", "Test Sync Size"):
 		frappe.get_doc(

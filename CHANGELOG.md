@@ -10,11 +10,33 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.2.3] — 2026-05-08
+
+**Target bench:** bench-37067
+**Branch:** `version-16`
+**Deployed:** 2026-05-08 (pending — this entry written ahead of deploy)
+
+### Fixed — B22: null-`product_id` line items must not crash whole-order sync
+
+Shopify emits line items with `product_id == None` (or the key omitted entirely) for FREE-GIFT promo lines added by discount apps, MISC-MANUAL freeform entries, and a handful of other store-side patterns. Pre-B22, `create_items_if_not_exist` (called at the top of every order webhook handler) read `item["product_id"]` directly, which raised `KeyError`/`TypeError` on the very first such line. The exception bubbled up and aborted the entire order's item-sync, causing the parent SO never to materialize.
+
+This was the root cause of the 33+ orders that failed to sync between 2026-04-15 and 2026-05-07 (manually backfilled via `scripts/backfill_orders` helpers; ERPNext commits `e7385c8`, `748c72e`, `ce9b516`, et al).
+
+**Fix:** [`ecommerce_integrations/shopify/product.py:269-289`](https://github.com/milky-claw/ecommerce_integrations/blob/version-16/ecommerce_integrations/shopify/product.py#L269) — switch `item["product_id"]` to `item.get("product_id")`, then `continue` past lines where the value is null/missing. These lines have no upstream Shopify Product to sync; yei should pass through. The parent SO still gets created with the placeholder line items pointing at the YGH-managed Items (MISC-MANUAL, etc.) or being skipped entirely for FREE-GIFT lines.
+
+**Tests:** 2 new in `test_product.py::TestCreateItemsIfNotExist`:
+- `test_skips_null_product_id_lines` — order with three lines (None, "", real); only the real one constructs `ShopifyProduct(...)`.
+- `test_missing_product_id_key_does_not_raise` — line dict without the `product_id` key at all is silently skipped.
+
+`__version__` bumped 1.2.0 → 1.2.3 (catches up with shipped tags 1.2.1, 1.2.2 which never bumped the string).
+
 ## [yei-v1.2.2] — 2026-04-24
 
 **Target bench:** bench-37067
 **Branch:** `version-16`
-**Commit:** _pending_
+**Commit:** [`2653222`](https://github.com/milky-claw/ecommerce_integrations/commit/2653222)
+**GitHub Release:** https://github.com/milky-claw/ecommerce_integrations/releases/tag/yei-v1.2.2
+**Deployed:** 2026-04-24 15:03Z (candidate `b908suld44`, migration `8fehsl35ir`)
 
 Combined release:
 1. **B21** — close the f-027 regression vector (order-sync-path analogue of B20).

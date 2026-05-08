@@ -267,9 +267,20 @@ def _match_sku_and_link_item(item_dict, product_id, variant_id) -> bool:
 
 
 def create_items_if_not_exist(order):
-	"""Using shopify order, sync all items that are not already synced."""
+	"""Using shopify order, sync all items that are not already synced.
+
+	B22: Skip line items with missing/null ``product_id``. Shopify emits
+	these on FREE-GIFT promo lines (added by discount apps), MISC-MANUAL
+	freeform entries, and a few other store-side patterns. They have no
+	upstream Shopify Product to sync — yei should pass through. Without
+	this guard, a single null-product_id line raises and crashes the
+	whole order's item-sync (the regression that caused 33+ orders to
+	fail to materialize between 2026-04-15 and 2026-05-07).
+	"""
 	for item in order.get("line_items", []):
-		product_id = item["product_id"]
+		product_id = item.get("product_id")
+		if not product_id:
+			continue
 		variant_id = item.get("variant_id")
 		sku = item.get("sku")
 		product = ShopifyProduct(product_id, variant_id=variant_id, sku=sku)
