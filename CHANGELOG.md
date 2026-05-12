@@ -10,6 +10,42 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.2.6] — 2026-05-12
+
+**B24 — refund handling (no-amend, flag-only model).** Triggered by Shopify orders #2993 + #4039 + a 478-order historical refund backlog ERPNext had never seen. The connector previously read `line_items[].quantity` (creation-time) and ignored `current_quantity` (post-refund authoritative) plus the entire `refunds[]` array.
+
+**What ships:**
+
+1. **`refunds/create` webhook subscribed** → new `ecommerce_integrations/shopify/refund.py`. Idempotent via ToDo-lookup (re-fires of the same `refund_id` short-circuit).
+2. **No-amend dispatch.** Refund webhook flags `Sales Order Item.shopify_refunded=1` + `shopify_refunded_at=refunds[].created_at`. When a `Delivery Note` exists for the SO, mirrors the flag to `Delivery Note Item.shopify_refunded=1` via `so_detail`. SO and DN docstatus are never amended; `frappe.copy_doc` and `.cancel()` are source-invariant absent from `refund.py`.
+3. **Restock-type-aware ToDo.** One native `ToDo` per refund event with refund_id in description (idempotency key). Title varies by `restock_type` (`no_restock` / `return` / `cancel` / `legacy_restock` / shipping-only). Priority `High` if refund total ≥ $1,000 else `Medium`.
+4. **`current_quantity` flip at 4 `order.py` call sites** (`_separate_tips:335`, `get_order_items:377`, `_get_item_price:477`, `_build_order_edit_diff:801,811`). Lines with `current_quantity == 0` are skipped entirely in `get_order_items` — new orders never insert SO Item rows for already-refunded-at-creation lines. Fallback to `quantity` for older API responses.
+5. **3 `current_*` Currency Custom Fields on Sales Order** (`shopify_current_subtotal_price`, `shopify_current_total_price`, `shopify_current_total_discounts`). Drift indicators populated by `populate_current_totals()` from any `orders/*` or `refunds/*` event.
+6. **2 SO Item + 2 DN Item Custom Fields** (`shopify_refunded` Check + `shopify_refunded_at` Datetime, both `allow_on_submit=1`). yei now installs Custom Fields on `Delivery Note Item` — previously yei only touched `Delivery Note` itself. Mirror flag propagates SO Item → DN Item at refund time.
+7. **`reconcile_so_against_current_quantity(so_name, dry_run=False)` backfill helper.** Per-SO compare of ERPNext qty vs Shopify `current_quantity`; flags drifted lines with a synthetic refund (`refund_id=reconcile-<so>`). Phase 1 (non-destructive `populate_current_totals` over 478 historical SOs) and Phase 2 (flagging) run post-deploy with `dry_run=True` gate + 50/run hard limit + decision-register entry before non-dry-run.
+
+**Stage 04d / ygh_fedex coupling.** `Delivery Note Item.shopify_refunded_at` is read by ygf's supplier-sheet writer (v0.4.x, not in this release) to prefix descriptor cells with `CANCELLED YYYY-MM-DD: …` on the manufacturer Google Sheet. Deploy order at v0.4.x time: ygf first (writer ready), then yei (starts setting flags). Until ygf-v0.4.x ships, the SO/DN flags are still useful in the ERPNext UI but the supplier sheet won't reflect them.
+
+**Test coverage.** 57 new standalone tests in `tests/test_b24_refunds.py`:
+- Source-invariants against the production `order.py` and `refund.py` files (no bare `quantity` reads in 4 functions; no `copy_doc` / `.cancel()` / `.submit()` in `refund.py`).
+- Pure-helper unit tests: restock_type → ToDo title mapping; ToDo priority threshold.
+- Behavioral (Frappe-mocked) tests on `apply_refund`: no copy_doc, flag wiring, draft-SO qty-reduction branch, Comment with refund_id, populate_current_totals invocation.
+- Idempotency tests on `handle_refund_created` (existing-ToDo short-circuit; missing-order short-circuit; missing-order-id short-circuit).
+
+Baseline preserved: 141 + 35 prior tests still pass; no regressions.
+
+**B7 self-heal deferred** to a later v1.2.x release. Original design bundled B7+B24 into `yei-v1.3.0`; B24 ships solo as v1.2.6 to keep the v1.2.x patch rhythm and to let B7 land in its own audited release.
+
+**Post-deploy steps** (not part of this tag):
+- Register `refunds/create` via Shopify Admin API (one-off).
+- Phase 1 backfill: `populate_current_totals` over 478 historical SOs (non-destructive).
+- Phase 2 backfill: `reconcile_so_against_current_quantity` dry-run gate per SO, then non-dry-run with 50/run hard limit + decision-register entry first.
+- Smoke test: mint a test refund on a low-value SO with submitted DN; verify chain.
+
+Design refs: `stages/04c-data-sync/references/b24-impl-removed-items.md`, `b24-refunds-and-current-quantity.md`, `stages/04d-exports/references/supplier-sheet-cancel-mark.md`.
+
+---
+
 ## [yei-v1.2.5] — 2026-05-09
 
 **Hotfix on top of 1.2.4.** Two follow-ups:

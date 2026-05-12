@@ -19,6 +19,8 @@ WEBHOOK_EVENTS = [
 	# warranty, stockv1/v2, etc.) flow to Item.shopify_tags in real time.
 	"products/create",
 	"products/update",
+	# B24: refund handling — flag SO/DN Items in place, no amend.
+	"refunds/create",
 ]
 
 EVENT_MAPPER = {
@@ -30,6 +32,7 @@ EVENT_MAPPER = {
 	"orders/edited": "ecommerce_integrations.shopify.order.handle_order_edited",
 	"products/create": "ecommerce_integrations.shopify.product.sync_product_from_webhook",  # B5
 	"products/update": "ecommerce_integrations.shopify.product.sync_product_from_webhook",  # B5
+	"refunds/create": "ecommerce_integrations.shopify.refund.handle_refund_created",  # B24
 }
 
 SHOPIFY_VARIANTS_ATTR_LIST = ["option1", "option2", "option3"]
@@ -60,6 +63,15 @@ ITEM_METAFIELDS_FIELD = "shopify_metafields"
 # B23: per-line + SO-level freight class derived from Shopify product tags.
 # Same fieldname on both doctypes (different specs — see setup_custom_fields).
 FREIGHT_CLASS_FIELD = "shopify_freight_class"
+
+# B24: refund handling. Shopify's current_* running totals on SO (drift
+# detection) + per-line refund flags + refund-event timestamp on SO Item
+# and DN Item. Read by ygf supplier-sheet writer for CANCELLED prefix.
+CURRENT_SUBTOTAL_PRICE_FIELD = "shopify_current_subtotal_price"
+CURRENT_TOTAL_PRICE_FIELD = "shopify_current_total_price"
+CURRENT_TOTAL_DISCOUNTS_FIELD = "shopify_current_total_discounts"
+ITEM_REFUNDED_FIELD = "shopify_refunded"           # SO Item + DN Item
+ITEM_REFUNDED_AT_FIELD = "shopify_refunded_at"     # SO Item + DN Item
 
 UNMATCHED_ITEM_CODE = "MISC-MANUAL"
 

@@ -332,7 +332,10 @@ def _separate_tips(line_items):
 
 	for item in line_items:
 		if cstr(item.get("title")).strip().lower() == "tip":
-			tip_total += flt(item.get("price", 0)) * cint(item.get("quantity", 1))
+			# B24b: current_quantity is authoritative post-refund. Refunded
+			# tips contribute 0; fall back to quantity for older payloads.
+			qty = cint(item.get("current_quantity", item.get("quantity", 1)))
+			tip_total += flt(item.get("price", 0)) * qty
 		else:
 			regular_items.append(item)
 
@@ -343,6 +346,16 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 	items = []
 
 	for shopify_item in order_items:
+		# B24b: skip lines fully refunded at order creation. Shopify's
+		# `current_quantity` is the authoritative post-refund qty; 0 means
+		# the line was removed. New orders must not insert SO Items for
+		# these lines. Fall back to `quantity` for older API responses.
+		current_qty = cint(
+			shopify_item.get("current_quantity", shopify_item.get("quantity", 1))
+		)
+		if current_qty == 0:
+			continue
+
 		item_code = None
 
 		if shopify_item.get("product_exists") and shopify_item.get("product_id"):
@@ -373,8 +386,11 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 		# save from sources the connector can't easily predict. By setting
 		# plr=rate explicitly, we short-circuit reconciliation — plr and
 		# rate match, no override.
+		# B24b: qty already resolved from current_quantity (with quantity
+		# fallback) above; the current_qty == 0 guard means dividing by
+		# it is safe without the `or 1` belt-and-braces.
 		price = flt(shopify_item.get("price"))
-		qty = cint(shopify_item.get("quantity")) or 1
+		qty = current_qty
 		total_discount = _get_total_discount(shopify_item)
 		per_unit_discount = total_discount / qty
 
@@ -474,7 +490,8 @@ def _resolve_shipping_method(shopify_item):
 
 def _get_item_price(line_item, taxes_inclusive: bool) -> float:
 	price = flt(line_item.get("price"))
-	qty = cint(line_item.get("quantity"))
+	# B24b: current_quantity is authoritative post-refund.
+	qty = cint(line_item.get("current_quantity", line_item.get("quantity")))
 
 	# remove line item level discounts
 	total_discount = _get_total_discount(line_item)
@@ -798,7 +815,8 @@ def _build_order_edit_diff(sales_order, shopify_order):
 		if title not in existing_titles:
 			for li in items:
 				price = li.get("price", "0")
-				qty = li.get("quantity", 1)
+				# B24b: current_quantity over quantity (post-refund authoritative).
+				qty = li.get("current_quantity", li.get("quantity", 1))
 				diff_lines.append(f"+ NEW ITEM: {title} (qty: {qty}, price: ${price})")
 
 	# Detect quantity/price changes for existing items
@@ -808,7 +826,8 @@ def _build_order_edit_diff(sales_order, shopify_order):
 			if li.get("title") == item.item_name or li.get("sku") == item.item_code
 		]
 		for li in matching:
-			new_qty = cint(li.get("quantity"))
+			# B24b: current_quantity over quantity (post-refund authoritative).
+			new_qty = cint(li.get("current_quantity", li.get("quantity")))
 			new_price = flt(li.get("price"))
 			if new_qty != cint(item.qty):
 				diff_lines.append(

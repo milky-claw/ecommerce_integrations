@@ -16,10 +16,15 @@ from ecommerce_integrations.controllers.setting import (
 from ecommerce_integrations.shopify import connection
 from ecommerce_integrations.shopify.constants import (
 	ADDRESS_ID_FIELD,
+	CURRENT_SUBTOTAL_PRICE_FIELD,
+	CURRENT_TOTAL_DISCOUNTS_FIELD,
+	CURRENT_TOTAL_PRICE_FIELD,
 	CUSTOMER_ID_FIELD,
 	FREIGHT_CLASS_FIELD,
 	FULLFILLMENT_ID_FIELD,
 	ITEM_METAFIELDS_FIELD,
+	ITEM_REFUNDED_AT_FIELD,
+	ITEM_REFUNDED_FIELD,
 	ITEM_TAGS_FIELD,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
@@ -387,6 +392,41 @@ def setup_custom_fields():
 				print_hide=1,
 				allow_on_submit=1,
 			),
+			# B24c: Shopify's current_* running totals — drift indicators
+			# visible on the SO form once refunds land. No native ERPNext
+			# equivalent (grand_total is the original total, not the
+			# post-refund total). Read-only; populated by sync_sales_order,
+			# handle_order_edited, handle_refund_created, backfill.
+			dict(
+				fieldname=CURRENT_SUBTOTAL_PRICE_FIELD,
+				label="Shopify Current Subtotal",
+				fieldtype="Currency",
+				options="currency",
+				insert_after=ORDER_FINANCIAL_STATUS_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
+			dict(
+				fieldname=CURRENT_TOTAL_PRICE_FIELD,
+				label="Shopify Current Total",
+				fieldtype="Currency",
+				options="currency",
+				insert_after=CURRENT_SUBTOTAL_PRICE_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
+			dict(
+				fieldname=CURRENT_TOTAL_DISCOUNTS_FIELD,
+				label="Shopify Current Discounts",
+				fieldtype="Currency",
+				options="currency",
+				insert_after=CURRENT_TOTAL_PRICE_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
 		],
 		# B21: shopify_item_discount retired — B15's native price_list_rate
 		# + rate = effective_rate (dollar-amount model) is the discount
@@ -419,6 +459,59 @@ def setup_custom_fields():
 				fieldtype="Select",
 				options="\nair\nsea\ndropship",
 				insert_after=ORDER_ITEM_SHIPPING_METHOD_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
+			# B24a: per-line refund flag — drives Stage 04d supplier-sheet
+			# CANCELLED prefix and is the canonical "this line was refunded"
+			# signal. refunded_at carries the Shopify refunds[].created_at
+			# moment (used by ygf for the CANCELLED-prefix date). Both
+			# allow_on_submit=1 because refunds arrive after SO submit.
+			dict(
+				fieldname=ITEM_REFUNDED_FIELD,
+				label="Refunded",
+				fieldtype="Check",
+				default=0,
+				insert_after=FREIGHT_CLASS_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
+			dict(
+				fieldname=ITEM_REFUNDED_AT_FIELD,
+				label="Refunded At",
+				fieldtype="Datetime",
+				insert_after=ITEM_REFUNDED_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+				description=(
+					"Set from refunds[].created_at on webhook; used by "
+					"Stage 04d (ygf) for the CANCELLED-prefix date."
+				),
+			),
+		],
+		# B24a: yei now installs Custom Fields on DN Item (previously only
+		# DN itself was touched). Mirror of SO Item refund flag — apply_refund
+		# propagates SO Item flag → DN Item flag when a DN exists. ygf reads
+		# this flag on every supplier-sheet cron run.
+		"Delivery Note Item": [
+			dict(
+				fieldname=ITEM_REFUNDED_FIELD,
+				label="Refunded",
+				fieldtype="Check",
+				default=0,
+				insert_after="against_sales_order",
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
+			dict(
+				fieldname=ITEM_REFUNDED_AT_FIELD,
+				label="Refunded At",
+				fieldtype="Datetime",
+				insert_after=ITEM_REFUNDED_FIELD,
 				read_only=1,
 				print_hide=1,
 				allow_on_submit=1,
