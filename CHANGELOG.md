@@ -10,6 +10,48 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.0] — 2026-05-12
+
+**Wave B — shipping-classification reader cutover + dead-code purge.** Companion to ygf-v0.5.0. Contract phase of the expand-contract migration that started in yei-v1.2.7 / ygf-v0.4.1.
+
+### Why
+
+Wave A installed new fields beside old + dual-wrote. Wave A backfill landed (6,299 mutations PASS, idempotent re-run confirmed). Wave B flips every reader to the new field set and stops writing the old. Legacy fields stay in DB (`shopify_freight_class`, `shopify_shipping_method`, `shopify_tags`) — Wave C deletes them once observation gates pass.
+
+### Code changes — writers
+
+- [`shopify/order.py:create_sales_order`](ecommerce_integrations/shopify/order.py) — drops `FREIGHT_CLASS_FIELD` writes at SO header + per SO Item. Drops `ORDER_ITEM_SHIPPING_METHOD_FIELD` writer at the SOI builder. Only `SO_SHIP_CLASS_FIELD` (SO header) + `ITEM_SHIP_METHOD_FIELD` (per SOI, with `ship-` prefix) are written.
+- [`shopify/freight_class.py:recompute_for_so`](ecommerce_integrations/shopify/freight_class.py) — drops dual-writes of `shopify_freight_class` at SO + SOI + draft-DN cascade. Only `so_ship_class` / `item_ship_method` / `dn_ship_method` written.
+
+### Code changes — readers
+
+- [`shopify/order.py:create_sales_order`](ecommerce_integrations/shopify/order.py) — B16 has_dropship detection flips from `ORDER_ITEM_SHIPPING_METHOD_FIELD == "ship-dropship"` to `ITEM_SHIP_METHOD_FIELD == "ship-dropship"`. The dropship signal now lives on a single field instead of two.
+
+### Code deletions
+
+- `shopify/order.py:_resolve_shipping_method` — ~35 LOC. Reader of `Item.shopify_tags`; obsolete post-cutover because `item_ship_method` is the live-fetched source of truth. Test surrogates in `test_connector_patches.py` are independent reimplementations and remain.
+
+### Tests
+
+4 tests in `test_freight_class.py::TestWaveBSingleWriteRecomputeForSO` (renamed from `TestWaveADualWriteRecomputeForSO`):
+
+- `test_so_header_writes_new_field_only` — asserts `so_ship_class` IS written, `shopify_freight_class` is NOT.
+- `test_soi_writes_item_ship_method_with_prefix` — same shape on SOI with `ship-` prefix.
+- `test_cascade_writes_dn_ship_method_only` — same shape on DN cascade.
+- `test_no_cascade_when_rollup_is_split_or_dropship` — unchanged behavior; rollups still don't cascade.
+
+Total: 39 freight_class tests pass. `test_connector_patches` 141/141 and `test_b24_refunds` 57/57 unchanged.
+
+### Reversibility
+
+Fully reversible by reverting this commit + redeploying yei-v1.2.7. Wave A's dual-write left legacy fields populated; reverting code makes the readers + writers point at them again.
+
+### Deploy sequence
+
+Bundled with ygf-v0.5.0. Press deploy pin Frappe + ERPNext to current_release. No data mutation (Wave B is code-only).
+
+---
+
 ## [yei-v1.2.7] — 2026-05-12
 
 **Wave A — shipping-classification field consolidation (additive expand phase).** Companion to ygf-v0.4.1. Part of the multi-wave consolidation of shipping-class fields across yei + ygf + workspace (see ERPNext workspace `stages/04c-data-sync/references/shipping-fields-consolidation-2026-05-12.md` for the full plan).

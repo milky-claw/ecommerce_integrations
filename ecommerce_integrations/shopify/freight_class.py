@@ -197,21 +197,14 @@ def recompute_for_so(so_name, fetcher=None):
 	for idx, row in enumerate(so.items):
 		if idx < len(per_line):
 			cls = per_line[idx]
-			frappe.db.set_value(
-				"Sales Order Item", row.name, "shopify_freight_class",
-				cls, update_modified=False,
-			)
-			# Wave A dual-write: new item_ship_method carries the raw
-			# Shopify-tag form (air → ship-air, sea → ship-sea, etc.).
+			# Wave B (2026-05-12): write ONLY item_ship_method (with `ship-`
+			# prefix). Legacy `shopify_freight_class` is no longer written;
+			# the Custom Field row stays in the DB until Wave C deletes it.
 			frappe.db.set_value(
 				"Sales Order Item", row.name, "item_ship_method",
 				f"ship-{cls}" if cls else "", update_modified=False,
 			)
-	frappe.db.set_value(
-		"Sales Order", so_name, "shopify_freight_class",
-		rollup, update_modified=False,
-	)
-	# Wave A dual-write — identity copy at SO header.
+	# Wave B: write ONLY so_ship_class at SO header.
 	frappe.db.set_value(
 		"Sales Order", so_name, "so_ship_class",
 		rollup, update_modified=False,
@@ -221,14 +214,10 @@ def recompute_for_so(so_name, fetcher=None):
 	# where a Shopify retag/recompute updated the SO but left the DN
 	# carrying stale freight class. Buckets at the DN level (no "split"
 	# or "dropship"); we only push bare air/sea down so the DN's
-	# `shopify_freight_class` enum (`""|"air"|"sea"`) stays valid.
+	# `dn_ship_method` enum (`""|"air"|"sea"`) stays valid.
 	#
-	# Source of truth for the DN's class is the bucket assigned at
-	# materialization time, which lives on the DN itself. The cascade
-	# only touches DRAFT DNs (docstatus=0) for SOs where the bucket
-	# matches a bare class on the rollup (air or sea); split-SOs would
-	# have multiple DNs (one air, one sea) that already carry the right
-	# value from split.py and don't need cascade.
+	# Wave B (2026-05-12): cascade writes ONLY dn_ship_method now.
+	# Legacy shopify_freight_class on DN no longer written.
 	if rollup in ("air", "sea"):
 		draft_dns = frappe.db.sql(
 			"""
@@ -241,10 +230,6 @@ def recompute_for_so(so_name, fetcher=None):
 			as_dict=True,
 		)
 		for dn in draft_dns:
-			frappe.db.set_value(
-				"Delivery Note", dn["name"], "shopify_freight_class",
-				rollup, update_modified=False,
-			)
 			frappe.db.set_value(
 				"Delivery Note", dn["name"], "dn_ship_method",
 				rollup, update_modified=False,

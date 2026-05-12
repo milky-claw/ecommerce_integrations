@@ -13,7 +13,6 @@ from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import (
 	CUSTOMER_ID_FIELD,
 	EVENT_MAPPER,
-	FREIGHT_CLASS_FIELD,
 	ITEM_SHIP_METHOD_FIELD,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
@@ -21,7 +20,6 @@ from ecommerce_integrations.shopify.constants import (
 	ORDER_FULFILLMENT_STATUS_FIELD,
 	ORDER_ID_FIELD,
 	ORDER_ITEM_PROPERTIES_FIELD,
-	ORDER_ITEM_SHIPPING_METHOD_FIELD,
 	ORDER_NUMBER_FIELD,
 	ORDER_STATUS_FIELD,
 	ORDER_TIP_AMOUNT_FIELD,
@@ -123,9 +121,10 @@ def create_sales_order(shopify_order, setting, company=None):
 		for idx, item_row in enumerate(items):
 			if idx < len(freight_per_line):
 				cls = freight_per_line[idx]
-				item_row[FREIGHT_CLASS_FIELD] = cls
-				# Wave A dual-write: new ITEM_SHIP_METHOD_FIELD carries
-				# the raw Shopify-tag form with `ship-` prefix.
+				# Wave B (2026-05-12): write ONLY ITEM_SHIP_METHOD_FIELD
+				# with `ship-` prefix. Legacy FREIGHT_CLASS_FIELD on SO Item
+				# is no longer written; Custom Field row stays in DB until
+				# Wave C deletes it.
 				# Transform: air→ship-air, sea→ship-sea, dropship→ship-dropship.
 				item_row[ITEM_SHIP_METHOD_FIELD] = f"ship-{cls}" if cls else ""
 
@@ -159,8 +158,7 @@ def create_sales_order(shopify_order, setting, company=None):
 			ORDER_FULFILLMENT_STATUS_FIELD: shopify_order.get("fulfillment_status") or "",  # B10
 			ORDER_DISCOUNT_CODES_FIELD: discount_code_names,  # B8
 			ORDER_TIP_AMOUNT_FIELD: tip_total,  # B9
-			FREIGHT_CLASS_FIELD: freight_rollup,  # B23
-			SO_SHIP_CLASS_FIELD: freight_rollup,  # Wave A — identity dual-write
+			SO_SHIP_CLASS_FIELD: freight_rollup,  # B23 (Wave B — sole writer)
 			"customer": customer,
 			"transaction_date": order_date,
 			"delivery_date": delivery_date,  # B17
@@ -184,8 +182,11 @@ def create_sales_order(shopify_order, setting, company=None):
 		# B16: detect dropship — if any line is tagged ship-dropship, mark
 		# the SO so downstream (reporting, FedEx skip) can branch on a
 		# single field.
+		# Wave B (2026-05-12): reader flipped to ITEM_SHIP_METHOD_FIELD
+		# (the new field set by freight_per_line above). The old
+		# ORDER_ITEM_SHIPPING_METHOD_FIELD is no longer the source of truth.
 		has_dropship = any(
-			item.get(ORDER_ITEM_SHIPPING_METHOD_FIELD) == "ship-dropship"
+			item.get(ITEM_SHIP_METHOD_FIELD) == "ship-dropship"
 			for item in items
 		)
 		so.update(
@@ -379,8 +380,10 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 		properties = shopify_item.get("properties", [])
 		properties_json = json.dumps(properties) if properties else ""
 
-		# B7: Resolve shipping method from product tags
-		shipping_method = _resolve_shipping_method(shopify_item)
+		# B7 retired Wave B: shipping_method was derived from Item.shopify_tags
+		# via _resolve_shipping_method and written to ORDER_ITEM_SHIPPING_METHOD_FIELD.
+		# Post-Wave-B the per-line ITEM_SHIP_METHOD_FIELD (set by freight_per_line
+		# above from live Shopify product tags) is the sole source of truth.
 
 		# B15: set rate AND price_list_rate to the SAME discounted dollar
 		# value. Shopify's model is dollar amounts (discount_allocations),
@@ -426,7 +429,6 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 			"stock_uom": shopify_item.get("uom") or "Nos",
 			"warehouse": setting.warehouse,
 			ORDER_ITEM_PROPERTIES_FIELD: properties_json,  # B2
-			ORDER_ITEM_SHIPPING_METHOD_FIELD: shipping_method,  # B7
 		}
 
 		# B12: Store original title in description for unmatched items
@@ -457,43 +459,6 @@ def _ensure_misc_manual_item(setting):
 				"default_warehouse": setting.warehouse,
 			}
 		).insert(ignore_permissions=True)
-
-
-def _resolve_shipping_method(shopify_item):
-	"""B7 + B16: Determine shipping method from the product's tags.
-
-	Looks up the ERPNext Item linked to this Shopify product and reads
-	the shopify_tags custom field.
-
-	Returns: 'ship-sea' | 'ship-air' | 'ship-dropship' | ''
-	"""
-	product_id = shopify_item.get("product_id")
-	if not product_id:
-		return ""
-
-	# Look up Ecommerce Item → ERPNext Item → shopify_tags
-	from ecommerce_integrations.shopify.constants import ITEM_TAGS_FIELD
-
-	erpnext_item_code = frappe.db.get_value(
-		"Ecommerce Item",
-		{"integration": "shopify", "integration_item_code": str(product_id)},
-		"erpnext_item_code",
-	)
-	if not erpnext_item_code:
-		return ""
-
-	tags = frappe.db.get_value("Item", erpnext_item_code, ITEM_TAGS_FIELD) or ""
-	tags_lower = tags.lower()
-
-	# B16: Order matters: ship-dropship > ship-sea > ship-air
-	# (dropship bypasses all other routing)
-	if "ship-dropship" in tags_lower:
-		return "ship-dropship"
-	if "ship-sea" in tags_lower:
-		return "ship-sea"
-	if "ship-air" in tags_lower:
-		return "ship-air"
-	return ""
 
 
 def _get_item_price(line_item, taxes_inclusive: bool) -> float:

@@ -247,14 +247,15 @@ class TestLiveFetcherCaching(unittest.TestCase):
 					sys.modules[k] = v
 
 
-class TestWaveADualWriteRecomputeForSO(unittest.TestCase):
-	"""Wave A — `recompute_for_so` must dual-write old + new fields on SO + SOI.
+class TestWaveBSingleWriteRecomputeForSO(unittest.TestCase):
+	"""Wave B (2026-05-12 reader cutover) — `recompute_for_so` writes ONLY
+	the new field set; legacy fields are no longer written.
 
 	Stubs frappe.db.{exists,get_doc,set_value,sql} + shopify.resources.Order so
 	the whitelisted function body runs end-to-end against in-memory fakes.
-	Asserts that BOTH `shopify_freight_class` (legacy) AND `so_ship_class` /
-	`item_ship_method` (Wave A new) writes land for each SO + SOI mutation,
-	and that draft DNs receive the same identity cascade.
+	Asserts that ONLY `so_ship_class` (SO) / `item_ship_method` (SOI) /
+	`dn_ship_method` (DN cascade) are written; the legacy
+	`shopify_freight_class` field is NOT written on any of the three doctypes.
 	"""
 
 	def _build_stubs(self, so_items, lines, draft_dns=()):
@@ -336,8 +337,8 @@ class TestWaveADualWriteRecomputeForSO(unittest.TestCase):
 
 		return set_value_calls, restore
 
-	def test_dual_writes_so_header_old_and_new(self):
-		"""SO.shopify_freight_class AND SO.so_ship_class both written."""
+	def test_so_header_writes_new_field_only(self):
+		"""SO.so_ship_class is written. Legacy SO.shopify_freight_class is NOT."""
 		set_calls, restore = self._build_stubs(
 			so_items=[("SOI-1", "ITEM-A")],
 			lines=[{"product_id": 100, "title": "Greenhouse"}],
@@ -350,20 +351,19 @@ class TestWaveADualWriteRecomputeForSO(unittest.TestCase):
 			result = freight_class.recompute_for_so("SO-1", fetcher=fetcher)
 			self.assertEqual(result["rollup"], "air")
 
-			# Look for both writes at SO header.
 			so_writes = [c for c in set_calls if c[0] == "Sales Order"]
 			fields_written = {c[2] for c in so_writes}
-			self.assertIn("shopify_freight_class", fields_written)
+			# Wave B: only new field on SO header.
 			self.assertIn("so_ship_class", fields_written)
-			# Identity: same value.
-			old_value = next(c[3] for c in so_writes if c[2] == "shopify_freight_class")
+			self.assertNotIn("shopify_freight_class", fields_written)
+			# Value carries the bare rollup.
 			new_value = next(c[3] for c in so_writes if c[2] == "so_ship_class")
-			self.assertEqual(old_value, new_value)
+			self.assertEqual(new_value, "air")
 		finally:
 			restore()
 
-	def test_dual_writes_soi_with_value_transform(self):
-		"""SOI.shopify_freight_class (bare) AND SOI.item_ship_method (prefixed)."""
+	def test_soi_writes_item_ship_method_with_prefix(self):
+		"""SOI.item_ship_method written with `ship-` prefix. Legacy field NOT written."""
 		set_calls, restore = self._build_stubs(
 			so_items=[("SOI-1", "ITEM-A"), ("SOI-2", "ITEM-B")],
 			lines=[
@@ -381,17 +381,17 @@ class TestWaveADualWriteRecomputeForSO(unittest.TestCase):
 			soi_writes = [c for c in set_calls if c[0] == "Sales Order Item"]
 			# Map of (soi_name, field) → value
 			writes = {(c[1], c[2]): c[3] for c in soi_writes}
-			# Old field carries bare class.
-			self.assertEqual(writes[("SOI-1", "shopify_freight_class")], "air")
-			self.assertEqual(writes[("SOI-2", "shopify_freight_class")], "sea")
-			# New field carries `ship-` prefixed form.
+			fields_written = {c[2] for c in soi_writes}
+			# Wave B: only new field, with `ship-` prefix.
+			self.assertIn("item_ship_method", fields_written)
+			self.assertNotIn("shopify_freight_class", fields_written)
 			self.assertEqual(writes[("SOI-1", "item_ship_method")], "ship-air")
 			self.assertEqual(writes[("SOI-2", "item_ship_method")], "ship-sea")
 		finally:
 			restore()
 
-	def test_cascade_dual_writes_to_draft_dn(self):
-		"""Draft DN linked to SO gets both shopify_freight_class + dn_ship_method."""
+	def test_cascade_writes_dn_ship_method_only(self):
+		"""Draft DN linked to SO gets dn_ship_method. Legacy shopify_freight_class NOT written."""
 		set_calls, restore = self._build_stubs(
 			so_items=[("SOI-1", "ITEM-A")],
 			lines=[{"product_id": 100, "title": "Greenhouse"}],
@@ -404,9 +404,10 @@ class TestWaveADualWriteRecomputeForSO(unittest.TestCase):
 
 			dn_writes = [c for c in set_calls if c[0] == "Delivery Note"]
 			fields_written = {c[2] for c in dn_writes}
-			self.assertIn("shopify_freight_class", fields_written)
+			# Wave B: only new field on DN cascade.
 			self.assertIn("dn_ship_method", fields_written)
-			# Identity cascade — value should be 'air' on both.
+			self.assertNotIn("shopify_freight_class", fields_written)
+			# Identity cascade — value should be 'air'.
 			for dt, name, field, value in dn_writes:
 				self.assertEqual(value, "air")
 				self.assertEqual(name, "DN-DRAFT-1")
