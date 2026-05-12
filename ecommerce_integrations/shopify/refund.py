@@ -26,6 +26,7 @@ from ecommerce_integrations.shopify.constants import (
 	CURRENT_TOTAL_PRICE_FIELD,
 	ITEM_REFUNDED_AT_FIELD,
 	ITEM_REFUNDED_FIELD,
+	LINE_ITEM_ID_FIELD,
 	ORDER_ID_FIELD,
 	SETTING_DOCTYPE,
 )
@@ -344,16 +345,58 @@ def _refund_restock_type(refund_lines):
 def _match_so_item(sales_order, shopify_line):
 	"""Locate the SO Item row for a Shopify refund_line_item.
 
-	Match priority: item_code + rate → item_code → item_name. Conservative
-	when ambiguous — returns the first hit; the Comment narrative records
-	when multiple lines could match."""
-	sku = (shopify_line.get("sku") or "").strip()
+	2026-05-13 — match priority is now:
+	  1. ``shopify_line_item_id`` equality (canonical key, populated for
+	     new orders post-this-release and via Phase-A retroactive backfill).
+	  2. ERPNext item_code equality after Shopify-SKU → ERPNext-SKU
+	     translation via ``shopify.product.get_item_code`` (covers
+	     Baumera translated SKUs, e.g. ``YG-Classic-45-9-6`` →
+	     ``WMP-FUL-1400X0300`` — the bug that made every Baumera refund
+	     silently fail).
+	  3. item_name equality (legacy fallback).
+
+	Tie-break for multi-line same-item_code: rate proximity (preserved
+	from pre-rewrite behaviour) when no ``shopify_line_item_id`` is yet
+	populated on the SO Item rows.
+	"""
+	# Local import keeps refund.py importable without Frappe at test time
+	# (the shopify.product module imports Frappe at module load).
+	try:
+		from ecommerce_integrations.shopify.product import get_item_code
+	except Exception:  # pragma: no cover - defensive on test envs
+		get_item_code = None
+
+	# 1. Primary: shopify_line_item_id equality.
+	line_id = shopify_line.get("id")
+	if line_id is not None:
+		line_id_s = str(line_id)
+		for it in sales_order.items:
+			if str(it.get(LINE_ITEM_ID_FIELD) or "") == line_id_s:
+				return it
+
+	# Translate Shopify SKU → ERPNext item_code if we have the mapper.
+	# The mapper looks up Item.shopify_product_id (via product webhook
+	# sync) and returns the canonical ERPNext item_code.
+	shopify_sku = (shopify_line.get("sku") or "").strip()
+	erp_item_code = shopify_sku
+	if get_item_code is not None:
+		try:
+			translated = get_item_code(shopify_line)
+			if translated:
+				erp_item_code = translated
+		except Exception:  # pragma: no cover - defensive
+			pass
+
 	title = (shopify_line.get("name") or shopify_line.get("title") or "").strip()
 	price = flt(shopify_line.get("price"))
 
-	by_code = [it for it in sales_order.items if (it.item_code or "") == sku]
-	if not by_code and sku:
-		# fallback: try item_name match
+	# 2. item_code equality (translated).
+	by_code = [it for it in sales_order.items if (it.item_code or "") == erp_item_code]
+	if not by_code and erp_item_code != shopify_sku and shopify_sku:
+		# Translation succeeded but no match — try the raw Shopify SKU too.
+		by_code = [it for it in sales_order.items if (it.item_code or "") == shopify_sku]
+	# 3. item_name fallback.
+	if not by_code and title:
 		by_code = [it for it in sales_order.items if (it.item_name or "") == title]
 	if not by_code:
 		return None
@@ -405,10 +448,40 @@ def _shopify_lines(shopify_order):
 
 def _match_shopify_line_to_so_item(shopify_lines, so_item):
 	"""Reverse of :func:`_match_so_item` — find the Shopify line that
-	corresponds to an ERPNext SO Item row."""
+	corresponds to an ERPNext SO Item row.
+
+	2026-05-13 — same translation-aware match chain as ``_match_so_item``:
+	  1. ``shopify_line_item_id`` equality (canonical key).
+	  2. Shopify-SKU → ERPNext-SKU translation via ``get_item_code``.
+	  3. Raw Shopify SKU equality (legacy).
+	"""
+	try:
+		from ecommerce_integrations.shopify.product import get_item_code
+	except Exception:  # pragma: no cover - defensive on test envs
+		get_item_code = None
+
+	so_line_id = str(so_item.get(LINE_ITEM_ID_FIELD) or "")
+	so_item_code = (so_item.item_code or "")
+
 	for li in shopify_lines:
 		line = li if isinstance(li, dict) else getattr(li, "attributes", {}) or {}
-		if (line.get("sku") or "") == (so_item.item_code or ""):
+		# 1. Primary: line_id equality.
+		if so_line_id and str(line.get("id") or "") == so_line_id:
+			return line
+
+	for li in shopify_lines:
+		line = li if isinstance(li, dict) else getattr(li, "attributes", {}) or {}
+		shopify_sku = (line.get("sku") or "")
+		# 2. Translated SKU equality.
+		if get_item_code is not None and shopify_sku:
+			try:
+				translated = get_item_code(line)
+			except Exception:  # pragma: no cover - defensive
+				translated = None
+			if translated and translated == so_item_code:
+				return line
+		# 3. Raw SKU equality (legacy).
+		if shopify_sku == so_item_code:
 			return line
 	return None
 

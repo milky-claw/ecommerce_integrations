@@ -11,9 +11,11 @@ from shopify.resources import Order
 
 from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import (
+	ADDRESS_ID_FIELD,
 	CUSTOMER_ID_FIELD,
 	EVENT_MAPPER,
 	ITEM_SHIP_METHOD_FIELD,
+	LINE_ITEM_ID_FIELD,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
 	ORDER_FULFILLMENT_SOURCE_FIELD,
@@ -148,6 +150,19 @@ def create_sales_order(shopify_order, setting, company=None):
 		discount_code_names = ", ".join(dc.get("code", "") for dc in discount_codes) if discount_codes else ""
 
 		taxes = get_order_taxes(shopify_order, setting, items)
+
+		# 2026-05-13 Issue #1 — per-order shipping Address record.
+		# Customer.shipping_address (Billing) is the payer name; the
+		# order-level shipping_address is the ship-to recipient. Create
+		# a NEW Address record per SO from order.shipping_address so
+		# Address.address_title = recipient_first + " " + recipient_last
+		# (not customer billing name). Falls back to Customer's primary
+		# Address if the order has no shipping_address (legacy POS,
+		# pickup orders, etc.).
+		per_order_ship_addr = _create_per_order_shipping_address(
+			shopify_order, customer,
+		)
+
 		so_dict = {
 			"doctype": "Sales Order",
 			"naming_series": setting.sales_order_series or "SO-Shopify-",
@@ -169,6 +184,8 @@ def create_sales_order(shopify_order, setting, company=None):
 			"taxes": taxes,
 			"tax_category": get_dummy_tax_category(),
 		}
+		if per_order_ship_addr:
+			so_dict["shipping_address_name"] = per_order_ship_addr
 		# B18: use Shopify order currency verbatim (USD for US store).
 		# conversion_rate is intentionally not set — ERPNext handles FX at SI time.
 		currency = _resolve_currency(shopify_order)
@@ -330,6 +347,65 @@ def _resolve_currency(shopify_order):
 	return c or None
 
 
+def _create_per_order_shipping_address(shopify_order, customer_name):
+	"""2026-05-13 Issue #1 — create a per-order Shipping Address record.
+
+	Address.address_title = order shipping_address.first_name + last_name
+	(the RECIPIENT name — what the supplier ships to). This differs from
+	the customer-level Billing Address whose title is the payer name.
+
+	Returns the new Address.name on success, ``None`` when the order has
+	no shipping_address (e.g. pickup, POS) — caller falls back to
+	Frappe's default (Customer's primary Address).
+
+	The Address record uses Frappe's default autoname (per D1 in the
+	consolidated design: supplier sheet col D renders `address_title` +
+	address fields, never the docname). Linked to the customer via
+	dynamic-link so it appears under the Customer's addresses.
+	"""
+	ship = shopify_order.get("shipping_address") or {}
+	if not ship or not customer_name:
+		return None
+
+	# Build recipient name from shipping_address.first_name + last_name.
+	# If both empty, fall back to whatever the customer record carries
+	# (e.g. "Default Customer" for guest orders).
+	first = cstr(ship.get("first_name")).strip()
+	last = cstr(ship.get("last_name")).strip()
+	recipient = (f"{first} {last}").strip() or customer_name
+
+	addr_doc = {
+		"doctype": "Address",
+		"address_title": recipient,
+		"address_type": "Shipping",
+		ADDRESS_ID_FIELD: ship.get("id"),
+		"address_line1": ship.get("address1") or "Address 1",
+		"address_line2": ship.get("address2"),
+		"city": ship.get("city"),
+		"state": ship.get("province"),
+		"pincode": ship.get("zip"),
+		"country": ship.get("country"),
+		"links": [{"link_doctype": "Customer", "link_name": customer_name}],
+	}
+	phone = ship.get("phone")
+	if phone:
+		addr_doc["phone"] = phone
+
+	try:
+		doc = frappe.get_doc(addr_doc)
+		doc.flags.ignore_mandatory = True
+		doc.insert(ignore_permissions=True)
+		return doc.name
+	except Exception as e:  # noqa: BLE001
+		# Non-fatal — SO creation continues with Customer's primary
+		# Address (the same fallback the connector used pre-fix).
+		frappe.log_error(
+			title="Issue #1 per-order Address create failed",
+			message=f"shopify_order={shopify_order.get('id')}: {e}",
+		)
+		return None
+
+
 def _separate_tips(line_items):
 	"""B9: Separate tip line items from regular line items.
 
@@ -419,6 +495,12 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 		# reconciliation). The old `shopify_item_discount` snapshot field
 		# is retired — native discount_amount on SOI already represents
 		# the same information at submit time if needed for reporting.
+		# 2026-05-13 supplier-sheet-3-issues: stamp `shopify_line_item_id`
+		# per row so refund.py:_match_so_item can disambiguate multi-line
+		# SOs that share an ERPNext item_code (e.g. ship-air + ship-sea
+		# variants of the same greenhouse). Stored as string — Shopify's
+		# 64-bit ids exceed JS-safe integer range.
+		line_item_id = shopify_item.get("id")
 		item_row = {
 			"item_code": item_code,
 			"item_name": shopify_item.get("name") or shopify_item.get("title"),
@@ -429,6 +511,7 @@ def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 			"stock_uom": shopify_item.get("uom") or "Nos",
 			"warehouse": setting.warehouse,
 			ORDER_ITEM_PROPERTIES_FIELD: properties_json,  # B2
+			LINE_ITEM_ID_FIELD: str(line_item_id) if line_item_id is not None else "",
 		}
 
 		# B12: Store original title in description for unmatched items
@@ -648,13 +731,23 @@ def get_sales_order(order_id):
 
 
 def cancel_order(payload, request_id=None):
-	"""Called by order/cancelled event.
+	"""Called by ``orders/cancelled`` webhook.
 
-	When shopify order is cancelled there could be many different someone handles it.
+	2026-05-13 Issue #3 — single-signal discipline. ``SO.docstatus == 2``
+	is the canonical "should the supplier ship / produce this?" gate
+	(read by ygf writer for col A "Cancelled" propagation). The legacy
+	guard suppressed ``.cancel()`` whenever a DN existed, leaving most
+	cancellations stuck at docstatus=1 and the supplier-sheet col A on
+	"New". Lifted here.
 
-	Updates document with custom field showing order status.
+	Dead-code purge: the legacy ``frappe.db.set_value`` writes onto
+	Sales Invoice and Delivery Note ``shopify_order_status`` had zero
+	readers in ygf (verified by missed-audit 2026-05-12) and SI flow
+	is disabled (``sync_sales_invoice=0``). Removed.
 
-	IF sales invoice / delivery notes are not generated against an order, then cancel it.
+	``shopify_order_status`` is still updated on the SO as a Shopify
+	Tags / financial-state mirror (diagnostic only — NOT consumed by
+	cancellation decisions).
 	"""
 	frappe.set_user("Administrator")
 	frappe.flags.request_id = request_id
@@ -671,19 +764,31 @@ def cancel_order(payload, request_id=None):
 			create_shopify_log(status="Invalid", message="Sales Order does not exist")
 			return
 
-		sales_invoice = frappe.db.get_value("Sales Invoice", filters={ORDER_ID_FIELD: order_id})
-		delivery_notes = frappe.db.get_list("Delivery Note", filters={ORDER_ID_FIELD: order_id})
+		# Demoted financial-mirror write — keep so the field stays in
+		# sync with Shopify's current financial_status even when
+		# ``.cancel()`` raises below.
+		frappe.db.set_value(
+			"Sales Order", sales_order.name, ORDER_STATUS_FIELD, order_status,
+		)
 
-		if sales_invoice:
-			frappe.db.set_value("Sales Invoice", sales_invoice, ORDER_STATUS_FIELD, order_status)
-
-		for dn in delivery_notes:
-			frappe.db.set_value("Delivery Note", dn.name, ORDER_STATUS_FIELD, order_status)
-
-		if not sales_invoice and not delivery_notes and sales_order.docstatus == 1:
-			sales_order.cancel()
-		else:
-			frappe.db.set_value("Sales Order", sales_order.name, ORDER_STATUS_FIELD, order_status)
+		if sales_order.docstatus == 1:
+			try:
+				# alpha26 hook (``ygh_fedex.split.cancel_dns_or_refuse``)
+				# cascades DN.cancel() and refuses if any DN has lr_no
+				# (FedEx AWB minted). The cascade raises
+				# ``frappe.ValidationError`` per D6.
+				sales_order.cancel()
+			except frappe.ValidationError as e:
+				# 5% edge: DN has AWB → package en route. Customer-service
+				# / refund territory; SO stays at docstatus=1 deliberately.
+				create_shopify_log(
+					status="Error",
+					message=(
+						f"Shopify cancel cannot propagate to SO {sales_order.name}: "
+						f"manual intervention required ({e})"
+					),
+				)
+				return
 
 	except Exception as e:
 		create_shopify_log(status="Error", exception=e)

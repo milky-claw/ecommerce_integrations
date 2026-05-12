@@ -26,6 +26,7 @@ from ecommerce_integrations.shopify.constants import (
 	ITEM_REFUNDED_AT_FIELD,
 	ITEM_REFUNDED_FIELD,
 	ITEM_SHIP_METHOD_FIELD,
+	LINE_ITEM_ID_FIELD,
 	ITEM_TAGS_FIELD,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
@@ -523,6 +524,19 @@ def setup_custom_fields():
 					"Stage 04d (ygf) for the CANCELLED-prefix date."
 				),
 			),
+			# 2026-05-13 Supplier-sheet-3-issues bundle — Shopify line-item
+			# id captured at SO creation; canonical refund-match key for
+			# refund.py:_match_so_item. allow_on_submit=1 because the
+			# retroactive backfill writes on already-submitted SOs.
+			dict(
+				fieldname=LINE_ITEM_ID_FIELD,
+				label="Shopify Line Item Id",
+				fieldtype="Data",
+				insert_after=ITEM_REFUNDED_AT_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
 		],
 		# B24a: yei now installs Custom Fields on DN Item (previously only
 		# DN itself was touched). Mirror of SO Item refund flag — apply_refund
@@ -544,6 +558,19 @@ def setup_custom_fields():
 				label="Refunded At",
 				fieldtype="Datetime",
 				insert_after=ITEM_REFUNDED_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
+			# 2026-05-13 Supplier-sheet-3-issues bundle — DN-Item mirror of
+			# the SO-Item line-item id. Cascaded by ygh_fedex.split at DN
+			# materialization; used by refund webhook handler to mirror
+			# the SO-Item flag onto every matching DN-Item.
+			dict(
+				fieldname=LINE_ITEM_ID_FIELD,
+				label="Shopify Line Item Id",
+				fieldtype="Data",
+				insert_after=ITEM_REFUNDED_AT_FIELD,
 				read_only=1,
 				print_hide=1,
 				allow_on_submit=1,

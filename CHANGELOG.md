@@ -10,6 +10,68 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.1] — 2026-05-13
+
+**Supplier-sheet 3-issue fix bundle (Issues #1, #2, #3).** Companion to ygf-v0.5.1. Trigger: Baumera-YGH + Palmako sheet audits, plus the 2026-05-13 Preorder investigation that reframed Issue #2's root cause from "preorder filter miss" to "refund-match SKU translation bug + B5 line-id capture broken in production."
+
+### Why
+
+Three correctness gaps on the supplier sheets:
+
+| # | Symptom | Audit count |
+|---|---|---|
+| 1 | Sheet col D shows payer name, not order-level ship-to recipient | ~106 Baumera + ~23 Palmako |
+| 2 | Refund flags never landed on past Baumera refunds (`_match_so_item` did naive item_code equality, but yei translates Shopify SKU → ERPNext item_code at sync time) | Every translated-SKU refund silently failed; ~150-300 historical rows in scope |
+| 3 | Sheet col A stays "New" after Shopify cancellation (`cancel_order` guards suppressed `.cancel()` whenever a DN existed) | 19 Baumera + 17 Palmako-mirror |
+
+### Schema bump (Fork A — only schema authorization granted this cycle)
+
+Two new Custom Fields installed by `add_shopify_line_item_id_fields` patch:
+
+- `Sales Order Item.shopify_line_item_id` — Data, read_only=1, allow_on_submit=1.
+- `Delivery Note Item.shopify_line_item_id` — Data, read_only=1, allow_on_submit=1.
+
+No native ERPNext / Frappe field encodes a Shopify GraphQL `LineItem.id`; integration-specific identifier (same shape as the existing `shopify_order_id` + `shopify_address_id` fields).
+
+### Code changes
+
+- [`shopify/order.py:create_sales_order`](ecommerce_integrations/shopify/order.py) — Issue #1: inline per-order shipping `Address` creation from `shopify_order["shipping_address"]`. `address_title = shipping_address.first_name + " " + last_name` (recipient name, not payer). `address_type="Shipping"`, linked to Customer. Helper `_create_per_order_shipping_address` near `_resolve_currency`. SO is created with `shipping_address_name = <new addr>` overriding ERPNext's default-to-customer-Billing.
+- [`shopify/order.py:get_order_items`](ecommerce_integrations/shopify/order.py) — Issue #2 B5 fix: stamps `shopify_line_item_id` on every SO Item from `line_item.id`. Stored as string (Shopify ids are 64-bit, exceed JS-safe integer).
+- [`shopify/order.py:cancel_order`](ecommerce_integrations/shopify/order.py) — Issue #3: lifts the SI + DN guards (legacy `if not delivery_notes and not sales_invoice` block); always attempts `sales_order.cancel()` on submitted SOs. Catches `frappe.ValidationError` raised by the alpha26 ygf `on_cancel` hook when any linked DN has `lr_no` (AWB minted). Deletes the dead-code writes of `ORDER_STATUS_FIELD` onto Sales Invoice and Delivery Note (zero readers; SI flow disabled).
+- [`shopify/refund.py:_match_so_item`](ecommerce_integrations/shopify/refund.py) — Issue #2 core: primary match key is `shopify_line_item_id`; falls back to Shopify-SKU → ERPNext-item_code translation via `product.get_item_code`; raw SKU equality as final fallback. Fixes the silent-Baumera-refund-fail bug.
+- [`shopify/refund.py:_match_shopify_line_to_so_item`](ecommerce_integrations/shopify/refund.py) — symmetric rewrite (reverse direction; used by `reconcile_so_against_current_quantity`).
+- [`shopify/doctype/shopify_setting/shopify_setting.py:setup_custom_fields`](ecommerce_integrations/shopify/doctype/shopify_setting/shopify_setting.py) — adds two new field specs (SO Item + DN Item).
+- [`shopify/constants.py`](ecommerce_integrations/shopify/constants.py) — declares `LINE_ITEM_ID_FIELD = "shopify_line_item_id"`.
+
+### Tests
+
+25 new tests in `tests/test_supplier_sheet_3_issues.py`:
+
+- 6 schema-bump source-invariants (constants + setup_custom_fields + patches.txt + patch file).
+- 3 Issue #1 source-invariants (helper defined, reads first/last name, called by create_sales_order).
+- 3 Issue #1 behavioural (recipient-name override, fallback when shipping_address absent, fallback when first/last empty).
+- 3 Issue #2 source-invariants (line_id stamp in get_order_items, translation in both match functions).
+- 4 Issue #2 behavioural (line_id primary match, SKU fallback for legacy rows, no-match returns None, ambiguous-same-rate tie-break).
+- 6 Issue #3 source-invariants (guard lifted, .cancel() called unguarded, ValidationError caught, SI dead-write deleted, DN dead-write deleted, SO ORDER_STATUS_FIELD write preserved).
+
+Total: 262 yei tests (237 baseline + 25 new), 0 regressions.
+
+### Backfill (workspace, post-deploy)
+
+- `scripts/backfill_issue1_per_order_addresses.py` — walks SOs whose current `shipping_address_name` points at a Customer-Billing Address; creates a per-order Shipping Address; PUTs SO + every linked DN. ~129 candidate orders.
+- `scripts/backfill_issue2_shopify_walk.py` — Phase A populates `shopify_line_item_id` retroactively (~12K SO Items + cascaded DN Items). Phase B walks Shopify for refund signals and PUTs `shopify_refunded` flag via line-id matching. ~150-300 flag writes expected.
+- `scripts/backfill_issue3_cancelled_writer_kickoff.py` — triggers `sync_append_only` per manufacturer immediately rather than waiting for the hourly cron tick.
+
+### Reversibility
+
+Code revert restores yei-v1.3.0 behaviour. Custom Field rows can be retired in a future Wave-C-style cleanup once line-id capture is verified (the two fields are append-only diagnostic / match-key data, never deleted by this release).
+
+### Deploy
+
+Bundled with ygf-v0.5.1 in one Press candidate. Frappe + ERPNext pinned to current_release. The install patch runs as part of bench migrate.
+
+---
+
 ## [yei-v1.3.0] — 2026-05-12
 
 **Wave B — shipping-classification reader cutover + dead-code purge.** Companion to ygf-v0.5.0. Contract phase of the expand-contract migration that started in yei-v1.2.7 / ygf-v0.4.1.

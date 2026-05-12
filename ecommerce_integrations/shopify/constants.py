@@ -85,6 +85,15 @@ CURRENT_TOTAL_DISCOUNTS_FIELD = "shopify_current_total_discounts"
 ITEM_REFUNDED_FIELD = "shopify_refunded"           # SO Item + DN Item
 ITEM_REFUNDED_AT_FIELD = "shopify_refunded_at"     # SO Item + DN Item
 
+# 2026-05-13 Supplier-sheet-3-issues bundle — Shopify line-item id
+# captured on SO Item creation and cascaded to DN Item at materialization.
+# Canonical refund-match key for `_match_so_item`; disambiguates multi-line
+# SOs that share an ERPNext item_code (e.g. ship-air + ship-sea variants
+# of the same greenhouse model). Stored as Data (string) — Shopify's
+# LineItem.id is a 64-bit integer; string storage matches `shopify_order_id`
+# and `shopify_address_id` convention.
+LINE_ITEM_ID_FIELD = "shopify_line_item_id"        # SO Item + DN Item
+
 UNMATCHED_ITEM_CODE = "MISC-MANUAL"
 
 # ERPNext already defines the default UOMs from Shopify but names are different
