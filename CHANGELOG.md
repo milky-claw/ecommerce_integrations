@@ -10,6 +10,48 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.2.7] — 2026-05-12
+
+**Wave A — shipping-classification field consolidation (additive expand phase).** Companion to ygf-v0.4.1. Part of the multi-wave consolidation of shipping-class fields across yei + ygf + workspace (see ERPNext workspace `stages/04c-data-sync/references/shipping-fields-consolidation-2026-05-12.md` for the full plan).
+
+### Why
+
+Pre-consolidation surface had 9 shipping-classification fields scattered across SO, SO Item, DN, Item, Manufacturer with overlapping semantics and a 7-anomaly bug class where Shopify retag/recompute updated the SO but not the linked draft DN. The end-state schema collapses to 4 (one per doctype) with cleaner vocabularies per axis. Wave A is the expand phase: install new fields beside old, dual-write, leave readers on old. Wave B cuts readers over; Wave C drops old fields.
+
+### Schema additions (`add_wave_a_shipping_fields` patch)
+
+- `Sales Order.so_ship_class` — Select `air|sea|dropship|split|""`, `allow_on_submit=1`, anchored after `shopify_freight_class`.
+- `Sales Order Item.item_ship_method` — Select `ship-air|ship-sea|ship-dropship|""`, `allow_on_submit=1`, anchored after `shopify_freight_class`. Value carries the raw Shopify-tag form WITH the `ship-` prefix (visually distinct from the bare-class rollup at SO level).
+
+### Production dual-writes
+
+- [`shopify/order.py:create_sales_order`](ecommerce_integrations/shopify/order.py) — every SO sync from a Shopify webhook now stamps both legacy `shopify_freight_class` AND new `so_ship_class` at the SO header; per-line writes both `shopify_freight_class` (bare) AND `item_ship_method` (with `ship-` prefix).
+- [`shopify/freight_class.py:recompute_for_so`](ecommerce_integrations/shopify/freight_class.py) — manual/backfill recompute path now dual-writes at SO + per SO Item; additionally cascades to any draft Delivery Notes linked to the SO writing both `shopify_freight_class` and `dn_ship_method`. The B25 cascade was the structural fix for the 7-anomaly bug class — pre-Wave-A, a retag on a Shopify product would update the SO but leave the linked draft DN stale.
+
+### Observability
+
+- `freight_class.py:resolve_for_order` (line 122) and `freight_class.py:make_live_fetcher` (line 224) — bare `except Exception` clauses now call `frappe.log_error()`. Previously silent swallow during Shopify-API hiccups; surface-level symptom was DNs with empty `shopify_freight_class` that nobody could trace.
+
+### Tests
+
+4 new tests in `test_freight_class.py::TestWaveADualWriteRecomputeForSO`:
+- `test_dual_writes_so_header_old_and_new` — SO.shopify_freight_class AND SO.so_ship_class both written.
+- `test_dual_writes_soi_with_value_transform` — bare class on legacy field; `ship-` prefix on new field.
+- `test_cascade_dual_writes_to_draft_dn` — draft DN linked to SO gets both shopify_freight_class + dn_ship_method.
+- `test_no_cascade_when_rollup_is_split_or_dropship` — split rollups don't trigger DN cascade (DN-level value comes from split.py bucket, not the SO rollup).
+
+Total: 39 freight_class tests (35 baseline + 4 new). All passing. `test_connector_patches` 141/141 and `test_b24_refunds` 57/57 unchanged.
+
+### Backfill (deferred to post-deploy)
+
+Workspace `scripts/backfill_shipping_consolidation_wave_a.py` ports the legacy data into the new fields. SO identity copy (~2266 rows scope), SO Item with value transform (~6000+ rows), draft DN identity copy (2235 rows). Idempotent — re-run yields ok=0. Awaits Press deploy of yei + ygf Wave A first.
+
+### Deploy sequence
+
+Standard yei + ygf deploy ceremony (both apps share Wave A on the same bench bump). Awaits user greenlight per `feedback_no_deploy_without_greenlight.md`.
+
+---
+
 ## [yei-v1.2.6] — 2026-05-12
 
 **B24 — refund handling (no-amend, flag-only model).** Triggered by Shopify orders #2993 + #4039 + a 478-order historical refund backlog ERPNext had never seen. The connector previously read `line_items[].quantity` (creation-time) and ignored `current_quantity` (post-refund authoritative) plus the entire `refunds[]` array.

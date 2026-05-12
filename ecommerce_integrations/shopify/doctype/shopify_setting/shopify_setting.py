@@ -25,6 +25,7 @@ from ecommerce_integrations.shopify.constants import (
 	ITEM_METAFIELDS_FIELD,
 	ITEM_REFUNDED_AT_FIELD,
 	ITEM_REFUNDED_FIELD,
+	ITEM_SHIP_METHOD_FIELD,
 	ITEM_TAGS_FIELD,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
@@ -35,6 +36,7 @@ from ecommerce_integrations.shopify.constants import (
 	ORDER_NUMBER_FIELD,
 	ORDER_STATUS_FIELD,
 	ORDER_TIP_AMOUNT_FIELD,
+	SO_SHIP_CLASS_FIELD,
 	SUPPLIER_ID_FIELD,
 )
 from ecommerce_integrations.shopify.oauth import validate_oauth_credentials
@@ -392,6 +394,21 @@ def setup_custom_fields():
 				print_hide=1,
 				allow_on_submit=1,
 			),
+			# Wave A (2026-05-12 shipping consolidation): new SO header field
+			# that mirrors FREIGHT_CLASS_FIELD. Dual-write during expand-contract
+			# migration; reader cutover in Wave B; FREIGHT_CLASS_FIELD dropped
+			# in Wave C. Same option set (air|sea|dropship|split|"") — value is
+			# an identity copy of shopify_freight_class at the SO header.
+			dict(
+				fieldname=SO_SHIP_CLASS_FIELD,
+				label="Ship Class (rollup)",
+				fieldtype="Select",
+				options="\nair\nsea\ndropship\nsplit",
+				insert_after=FREIGHT_CLASS_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
 			# B24c: Shopify's current_* running totals — drift indicators
 			# visible on the SO form once refunds land. No native ERPNext
 			# equivalent (grand_total is the original total, not the
@@ -459,6 +476,21 @@ def setup_custom_fields():
 				fieldtype="Select",
 				options="\nair\nsea\ndropship",
 				insert_after=ORDER_ITEM_SHIPPING_METHOD_FIELD,
+				read_only=1,
+				print_hide=1,
+				allow_on_submit=1,
+			),
+			# Wave A (2026-05-12 shipping consolidation): new per-line field
+			# that mirrors FREIGHT_CLASS_FIELD on SO Item. Vocabulary uses the
+			# raw Shopify tag form WITH the "ship-" prefix (ship-air | ship-sea
+			# | ship-dropship | ""). Dual-write during expand-contract; reader
+			# cutover in Wave B; FREIGHT_CLASS_FIELD on SO Item dropped in Wave C.
+			dict(
+				fieldname=ITEM_SHIP_METHOD_FIELD,
+				label="Ship Method",
+				fieldtype="Select",
+				options="\nship-air\nship-sea\nship-dropship",
+				insert_after=FREIGHT_CLASS_FIELD,
 				read_only=1,
 				print_hide=1,
 				allow_on_submit=1,

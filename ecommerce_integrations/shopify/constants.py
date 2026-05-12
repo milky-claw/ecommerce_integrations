@@ -64,6 +64,18 @@ ITEM_METAFIELDS_FIELD = "shopify_metafields"
 # Same fieldname on both doctypes (different specs — see setup_custom_fields).
 FREIGHT_CLASS_FIELD = "shopify_freight_class"
 
+# Wave A (2026-05-12 shipping-classification consolidation): additive new
+# fields that mirror FREIGHT_CLASS_FIELD with cleaner names. Same writers
+# dual-populate both during the expand-contract migration. Reader cutover
+# happens in Wave B; old fields are dropped in Wave C.
+#
+# - SO_SHIP_CLASS_FIELD on Sales Order:        air | sea | dropship | split | ""
+# - ITEM_SHIP_METHOD_FIELD on Sales Order Item: ship-air | ship-sea | ship-dropship | ""
+#   (Value transform: SO Item's class is stored WITH the "ship-" prefix to
+#    match the raw Shopify tag vocabulary. Rollup at SO level stays bare.)
+SO_SHIP_CLASS_FIELD = "so_ship_class"
+ITEM_SHIP_METHOD_FIELD = "item_ship_method"
+
 # B24: refund handling. Shopify's current_* running totals on SO (drift
 # detection) + per-line refund flags + refund-event timestamp on SO Item
 # and DN Item. Read by ygf supplier-sheet writer for CANCELLED prefix.

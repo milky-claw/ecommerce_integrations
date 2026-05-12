@@ -247,5 +247,195 @@ class TestLiveFetcherCaching(unittest.TestCase):
 					sys.modules[k] = v
 
 
+class TestWaveADualWriteRecomputeForSO(unittest.TestCase):
+	"""Wave A — `recompute_for_so` must dual-write old + new fields on SO + SOI.
+
+	Stubs frappe.db.{exists,get_doc,set_value,sql} + shopify.resources.Order so
+	the whitelisted function body runs end-to-end against in-memory fakes.
+	Asserts that BOTH `shopify_freight_class` (legacy) AND `so_ship_class` /
+	`item_ship_method` (Wave A new) writes land for each SO + SOI mutation,
+	and that draft DNs receive the same identity cascade.
+	"""
+
+	def _build_stubs(self, so_items, lines, draft_dns=()):
+		"""Install frappe + shopify stubs.
+
+		Args:
+			so_items: list of (name, item_code) — SO Items to iterate.
+			lines: list of dicts with {product_id, title}.
+			draft_dns: list of DN names that should appear in the cascade
+				SELECT (already gated by docstatus=0 + against_sales_order).
+
+		Returns:
+			(set_value_calls, dn_set_value_calls) — list of (doctype, name,
+			field, value) tuples captured per call.
+		"""
+		from unittest.mock import MagicMock
+
+		set_value_calls = []
+
+		def fake_set_value(doctype, name, field, value, update_modified=False):
+			set_value_calls.append((doctype, name, field, value))
+
+		fake_frappe = MagicMock()
+		fake_frappe.db.exists.return_value = True
+		fake_frappe.db.set_value.side_effect = fake_set_value
+
+		# fake SO doc — only `.items` + `.get("shopify_order_id")` are touched.
+		class _Item:
+			def __init__(self, n, c):
+				self.name = n
+				self.item_code = c
+
+		fake_so = MagicMock()
+		fake_so.items = [_Item(n, c) for n, c in so_items]
+		fake_so.get.return_value = "999"  # any non-empty shopify_order_id
+
+		fake_frappe.get_doc.return_value = fake_so
+
+		# fake DN cascade SQL result
+		fake_frappe.db.sql.return_value = [{"name": n} for n in draft_dns]
+
+		# Inject fake frappe so the local `import frappe` inside
+		# recompute_for_so finds our stub.
+		original = sys.modules.get("frappe")
+		sys.modules["frappe"] = fake_frappe
+
+		# Shopify.resources.Order stub — Order.find returns a payload whose
+		# attributes.get("line_items") yields our lines.
+		fake_order = MagicMock()
+		def _li_from_dict(d):
+			obj = MagicMock()
+			obj.product_id = d.get("product_id")
+			obj.title = d.get("title", "")
+			obj.attributes = {"product_id": d.get("product_id")}
+			return obj
+		fake_order.attributes.get.return_value = [_li_from_dict(li) for li in lines]
+		fake_order_cls = MagicMock(find=MagicMock(return_value=fake_order))
+
+		fake_resources = MagicMock(Order=fake_order_cls)
+		fake_shopify = MagicMock(resources=fake_resources)
+		original_shopify = sys.modules.get("shopify")
+		original_shopify_res = sys.modules.get("shopify.resources")
+		sys.modules["shopify"] = fake_shopify
+		sys.modules["shopify.resources"] = fake_resources
+
+		def restore():
+			if original is None:
+				sys.modules.pop("frappe", None)
+			else:
+				sys.modules["frappe"] = original
+			if original_shopify is None:
+				sys.modules.pop("shopify", None)
+			else:
+				sys.modules["shopify"] = original_shopify
+			if original_shopify_res is None:
+				sys.modules.pop("shopify.resources", None)
+			else:
+				sys.modules["shopify.resources"] = original_shopify_res
+
+		return set_value_calls, restore
+
+	def test_dual_writes_so_header_old_and_new(self):
+		"""SO.shopify_freight_class AND SO.so_ship_class both written."""
+		set_calls, restore = self._build_stubs(
+			so_items=[("SOI-1", "ITEM-A")],
+			lines=[{"product_id": 100, "title": "Greenhouse"}],
+			draft_dns=[],
+		)
+		try:
+			from ecommerce_integrations.shopify import freight_class
+			# Inject a deterministic fetcher so we don't hit make_live_fetcher.
+			fetcher = lambda pid: ["ship-air"]
+			result = freight_class.recompute_for_so("SO-1", fetcher=fetcher)
+			self.assertEqual(result["rollup"], "air")
+
+			# Look for both writes at SO header.
+			so_writes = [c for c in set_calls if c[0] == "Sales Order"]
+			fields_written = {c[2] for c in so_writes}
+			self.assertIn("shopify_freight_class", fields_written)
+			self.assertIn("so_ship_class", fields_written)
+			# Identity: same value.
+			old_value = next(c[3] for c in so_writes if c[2] == "shopify_freight_class")
+			new_value = next(c[3] for c in so_writes if c[2] == "so_ship_class")
+			self.assertEqual(old_value, new_value)
+		finally:
+			restore()
+
+	def test_dual_writes_soi_with_value_transform(self):
+		"""SOI.shopify_freight_class (bare) AND SOI.item_ship_method (prefixed)."""
+		set_calls, restore = self._build_stubs(
+			so_items=[("SOI-1", "ITEM-A"), ("SOI-2", "ITEM-B")],
+			lines=[
+				{"product_id": 100, "title": "Air greenhouse"},
+				{"product_id": 200, "title": "Sea greenhouse"},
+			],
+			draft_dns=[],
+		)
+		try:
+			from ecommerce_integrations.shopify import freight_class
+			tag_map = {100: ["ship-air"], 200: ["ship-sea"]}
+			fetcher = lambda pid: tag_map.get(pid, [])
+			freight_class.recompute_for_so("SO-1", fetcher=fetcher)
+
+			soi_writes = [c for c in set_calls if c[0] == "Sales Order Item"]
+			# Map of (soi_name, field) → value
+			writes = {(c[1], c[2]): c[3] for c in soi_writes}
+			# Old field carries bare class.
+			self.assertEqual(writes[("SOI-1", "shopify_freight_class")], "air")
+			self.assertEqual(writes[("SOI-2", "shopify_freight_class")], "sea")
+			# New field carries `ship-` prefixed form.
+			self.assertEqual(writes[("SOI-1", "item_ship_method")], "ship-air")
+			self.assertEqual(writes[("SOI-2", "item_ship_method")], "ship-sea")
+		finally:
+			restore()
+
+	def test_cascade_dual_writes_to_draft_dn(self):
+		"""Draft DN linked to SO gets both shopify_freight_class + dn_ship_method."""
+		set_calls, restore = self._build_stubs(
+			so_items=[("SOI-1", "ITEM-A")],
+			lines=[{"product_id": 100, "title": "Greenhouse"}],
+			draft_dns=["DN-DRAFT-1"],
+		)
+		try:
+			from ecommerce_integrations.shopify import freight_class
+			fetcher = lambda pid: ["ship-air"]
+			freight_class.recompute_for_so("SO-1", fetcher=fetcher)
+
+			dn_writes = [c for c in set_calls if c[0] == "Delivery Note"]
+			fields_written = {c[2] for c in dn_writes}
+			self.assertIn("shopify_freight_class", fields_written)
+			self.assertIn("dn_ship_method", fields_written)
+			# Identity cascade — value should be 'air' on both.
+			for dt, name, field, value in dn_writes:
+				self.assertEqual(value, "air")
+				self.assertEqual(name, "DN-DRAFT-1")
+		finally:
+			restore()
+
+	def test_no_cascade_when_rollup_is_split_or_dropship(self):
+		"""Split/dropship rollups don't cascade — DN-level value comes from split.py bucket."""
+		set_calls, restore = self._build_stubs(
+			so_items=[("SOI-1", "ITEM-A"), ("SOI-2", "ITEM-B")],
+			lines=[
+				{"product_id": 100, "title": "Air"},
+				{"product_id": 200, "title": "Sea"},
+			],
+			draft_dns=["DN-DRAFT-1"],
+		)
+		try:
+			from ecommerce_integrations.shopify import freight_class
+			tag_map = {100: ["ship-air"], 200: ["ship-sea"]}
+			fetcher = lambda pid: tag_map.get(pid, [])
+			result = freight_class.recompute_for_so("SO-1", fetcher=fetcher)
+			self.assertEqual(result["rollup"], "split")
+
+			# DN cascade should NOT have fired for split rollup.
+			dn_writes = [c for c in set_calls if c[0] == "Delivery Note"]
+			self.assertEqual(dn_writes, [])
+		finally:
+			restore()
+
+
 if __name__ == "__main__":
 	unittest.main()

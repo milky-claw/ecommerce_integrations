@@ -14,6 +14,7 @@ from ecommerce_integrations.shopify.constants import (
 	CUSTOMER_ID_FIELD,
 	EVENT_MAPPER,
 	FREIGHT_CLASS_FIELD,
+	ITEM_SHIP_METHOD_FIELD,
 	ORDER_DISCOUNT_CODES_FIELD,
 	ORDER_FINANCIAL_STATUS_FIELD,
 	ORDER_FULFILLMENT_SOURCE_FIELD,
@@ -25,6 +26,7 @@ from ecommerce_integrations.shopify.constants import (
 	ORDER_STATUS_FIELD,
 	ORDER_TIP_AMOUNT_FIELD,
 	SETTING_DOCTYPE,
+	SO_SHIP_CLASS_FIELD,
 	UNMATCHED_ITEM_CODE,
 )
 from ecommerce_integrations.shopify.freight_class import (
@@ -120,7 +122,12 @@ def create_sales_order(shopify_order, setting, company=None):
 		)
 		for idx, item_row in enumerate(items):
 			if idx < len(freight_per_line):
-				item_row[FREIGHT_CLASS_FIELD] = freight_per_line[idx]
+				cls = freight_per_line[idx]
+				item_row[FREIGHT_CLASS_FIELD] = cls
+				# Wave A dual-write: new ITEM_SHIP_METHOD_FIELD carries
+				# the raw Shopify-tag form with `ship-` prefix.
+				# Transform: air→ship-air, sea→ship-sea, dropship→ship-dropship.
+				item_row[ITEM_SHIP_METHOD_FIELD] = f"ship-{cls}" if cls else ""
 
 		if not items:
 			message = (
@@ -153,6 +160,7 @@ def create_sales_order(shopify_order, setting, company=None):
 			ORDER_DISCOUNT_CODES_FIELD: discount_code_names,  # B8
 			ORDER_TIP_AMOUNT_FIELD: tip_total,  # B9
 			FREIGHT_CLASS_FIELD: freight_rollup,  # B23
+			SO_SHIP_CLASS_FIELD: freight_rollup,  # Wave A — identity dual-write
 			"customer": customer,
 			"transaction_date": order_date,
 			"delivery_date": delivery_date,  # B17

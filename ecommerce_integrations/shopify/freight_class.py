@@ -119,7 +119,18 @@ def resolve_for_order(shopify_order, fetcher):
 			continue
 		try:
 			tags = fetcher(pid)
-		except Exception:  # noqa: BLE001 — never crash sync over a tag lookup
+		except Exception as e:  # noqa: BLE001 — never crash sync over a tag lookup
+			# Wave A observability: previously a silent swallow; bare
+			# fetcher failures during Shopify-API hiccups now show up in
+			# Error Log so DN-empty-freight-class anomalies are traceable.
+			try:
+				import frappe as _f
+				_f.log_error(
+					title="B23 resolve_for_order: tag fetcher failed",
+					message=f"product_id={pid}: {type(e).__name__}: {e}",
+				)
+			except Exception:  # noqa: BLE001 — log path must never crash sync
+				pass
 			tags = []
 		per_line_classes.append(classify_product_tags(tags))
 	return per_line_classes, rollup_so(per_line_classes)
@@ -185,14 +196,59 @@ def recompute_for_so(so_name, fetcher=None):
 	per_line, rollup = resolve_for_order({"line_items": regular_lines}, fetcher)
 	for idx, row in enumerate(so.items):
 		if idx < len(per_line):
+			cls = per_line[idx]
 			frappe.db.set_value(
 				"Sales Order Item", row.name, "shopify_freight_class",
-				per_line[idx], update_modified=False,
+				cls, update_modified=False,
+			)
+			# Wave A dual-write: new item_ship_method carries the raw
+			# Shopify-tag form (air → ship-air, sea → ship-sea, etc.).
+			frappe.db.set_value(
+				"Sales Order Item", row.name, "item_ship_method",
+				f"ship-{cls}" if cls else "", update_modified=False,
 			)
 	frappe.db.set_value(
 		"Sales Order", so_name, "shopify_freight_class",
 		rollup, update_modified=False,
 	)
+	# Wave A dual-write — identity copy at SO header.
+	frappe.db.set_value(
+		"Sales Order", so_name, "so_ship_class",
+		rollup, update_modified=False,
+	)
+	# Wave A B25 cascade: also propagate to any draft Delivery Notes
+	# linked to this SO. Eliminates the historical 7-anomaly bug class
+	# where a Shopify retag/recompute updated the SO but left the DN
+	# carrying stale freight class. Buckets at the DN level (no "split"
+	# or "dropship"); we only push bare air/sea down so the DN's
+	# `shopify_freight_class` enum (`""|"air"|"sea"`) stays valid.
+	#
+	# Source of truth for the DN's class is the bucket assigned at
+	# materialization time, which lives on the DN itself. The cascade
+	# only touches DRAFT DNs (docstatus=0) for SOs where the bucket
+	# matches a bare class on the rollup (air or sea); split-SOs would
+	# have multiple DNs (one air, one sea) that already carry the right
+	# value from split.py and don't need cascade.
+	if rollup in ("air", "sea"):
+		draft_dns = frappe.db.sql(
+			"""
+			SELECT DISTINCT dn.name
+			FROM `tabDelivery Note` dn
+			JOIN `tabDelivery Note Item` dni ON dni.parent = dn.name
+			WHERE dni.against_sales_order = %(so)s AND dn.docstatus = 0
+			""",
+			{"so": so_name},
+			as_dict=True,
+		)
+		for dn in draft_dns:
+			frappe.db.set_value(
+				"Delivery Note", dn["name"], "shopify_freight_class",
+				rollup, update_modified=False,
+			)
+			frappe.db.set_value(
+				"Delivery Note", dn["name"], "dn_ship_method",
+				rollup, update_modified=False,
+			)
 	return {"per_line": per_line, "rollup": rollup}
 
 
@@ -221,7 +277,18 @@ def make_live_fetcher():
 			product = Product.find(product_id)
 			raw = (getattr(product, "tags", None) or "")
 			tags = [t.strip() for t in raw.split(",") if t.strip()]
-		except Exception:  # noqa: BLE001
+		except Exception as e:  # noqa: BLE001
+			# Wave A observability: previously a silent swallow; bare
+			# Product.find failures during Shopify-API hiccups now show up
+			# in Error Log so DN-empty-freight-class anomalies are traceable.
+			try:
+				import frappe as _f
+				_f.log_error(
+					title="B23 make_live_fetcher: Product.find failed",
+					message=f"product_id={product_id}: {type(e).__name__}: {e}",
+				)
+			except Exception:  # noqa: BLE001 — log path must never crash sync
+				pass
 			tags = []
 		cache[key] = tags
 		return tags
