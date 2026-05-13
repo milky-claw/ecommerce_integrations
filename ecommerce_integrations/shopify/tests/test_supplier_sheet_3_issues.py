@@ -824,10 +824,21 @@ class TestV134ReplayHandleOrderEditedSourceInvariant(unittest.TestCase):
 			"replay_handle_order_edited must be defined in order.py")
 
 	def test_replay_is_whitelisted(self):
-		# The @frappe.whitelist() decorator must precede the def.
+		# The @frappe.whitelist() decorator must precede the def (with the
+		# @temp_shopify_session decorator stacked between).
 		self.assertRegex(self.source,
-			r'@frappe\.whitelist\(\)\s*\ndef\s+replay_handle_order_edited\(',
-			"replay_handle_order_edited must be decorated with @frappe.whitelist()")
+			r'@frappe\.whitelist\(\)\s*\n@temp_shopify_session\s*\ndef\s+replay_handle_order_edited\(',
+			"replay_handle_order_edited must be decorated with "
+			"@frappe.whitelist() (outer) and @temp_shopify_session (inner)")
+
+	def test_replay_has_temp_shopify_session_decorator(self):
+		# The decorator is required for the handler's Order.find() REST call
+		# to succeed — live webhook flow gets the session via
+		# _validate_request, which the wrapper bypasses.
+		self.assertIn("@temp_shopify_session", self.source,
+			"replay_handle_order_edited must be decorated with "
+			"@temp_shopify_session so the delegated handler can call "
+			"Shopify REST (Order.find) inside an authenticated session")
 
 	def test_replay_enforces_system_manager(self):
 		body = _source_of("replay_handle_order_edited", self.source)

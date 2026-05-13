@@ -928,6 +928,7 @@ def handle_order_edited(payload, request_id=None):
 
 
 @frappe.whitelist()
+@temp_shopify_session
 def replay_handle_order_edited(shopify_order_id, request_id=None):
 	"""yei-v1.3.4: Admin-only entry point for backfilling historical
 	``orders/edited`` webhook drops.
@@ -938,6 +939,12 @@ def replay_handle_order_edited(shopify_order_id, request_id=None):
 
 	Bypasses the HMAC validation that ``_validate_request`` does for live
 	webhooks; the admin-role gate is the explicit trust boundary.
+
+	The ``@temp_shopify_session`` decorator establishes a Shopify session
+	so the handler's ``Order.find(str(order_id))`` REST call succeeds.
+	The live webhook flow gets its session via ``_validate_request`` in
+	the webhook entry point; we have to set one up explicitly here since
+	we bypass that path.
 
 	``request_id`` is intentionally passed through as-is (default ``None``).
 	When ``None``, ``create_shopify_log`` creates a fresh ``Ecommerce

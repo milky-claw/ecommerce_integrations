@@ -20,16 +20,16 @@ The clean path is a thin admin-callable wrapper that delegates to the existing h
 
 ### Code changes
 
-- [`shopify/order.py:replay_handle_order_edited`](ecommerce_integrations/shopify/order.py) — NEW `@frappe.whitelist()` wrapper. Builds a synthetic ``{"order_edit": {"order_id": str(...)}}`` payload and delegates to ``handle_order_edited``. Permission gate: System Manager role or session user = Administrator (bypasses HMAC validation that ``_validate_request`` does for live webhooks; admin-role is the explicit trust boundary). ``request_id`` is passed through as-is — if ``None``, ``create_shopify_log`` creates a fresh EIL row; forging a fake value breaks the downstream lookup with ``DoesNotExistError``. No new doctypes, no new Custom Fields, no Property Setters — pure code addition.
+- [`shopify/order.py:replay_handle_order_edited`](ecommerce_integrations/shopify/order.py) — NEW `@frappe.whitelist()` + `@temp_shopify_session` wrapper. Builds a synthetic ``{"order_edit": {"order_id": str(...)}}`` payload and delegates to ``handle_order_edited``. Permission gate: System Manager role or session user = Administrator (bypasses HMAC validation that ``_validate_request`` does for live webhooks; admin-role is the explicit trust boundary). ``@temp_shopify_session`` establishes the Shopify auth session so the handler's ``Order.find()`` REST call succeeds — live webhook flow gets its session via ``_validate_request`` (in the webhook entry point), which the wrapper bypasses. ``request_id`` is passed through as-is — if ``None``, ``create_shopify_log`` creates a fresh EIL row; forging a fake value breaks the downstream lookup with ``DoesNotExistError``. No new doctypes, no new Custom Fields, no Property Setters — pure code addition.
 
 ### Tests
 
-11 new tests in `tests/test_supplier_sheet_3_issues.py` (`TestV134*` suite):
+12 new tests in `tests/test_supplier_sheet_3_issues.py` (`TestV134*` suite):
 
-- 6 source-invariants on `replay_handle_order_edited` (function defined, @frappe.whitelist decorator, System Manager / Administrator gate, synthetic order_edit payload shape, delegates to handle_order_edited not duplicated logic, request_id passthrough not forged).
+- 7 source-invariants on `replay_handle_order_edited` (function defined, @frappe.whitelist + @temp_shopify_session stack, dedicated @temp_shopify_session check, System Manager / Administrator gate, synthetic order_edit payload shape, delegates to handle_order_edited not duplicated logic, request_id passthrough not forged).
 - 5 behavioural unit tests (admin check passes for SM / Administrator, blocks regular user; synthetic payload extraction matches handle_order_edited's logic; idempotent no-op for in-sync SO).
 
-Total: 300 yei tests (289 baseline + 11 new), 0 regressions.
+Total: 301 yei tests (289 baseline + 12 new), 0 regressions.
 
 ### Backfill (workspace, post-deploy)
 
