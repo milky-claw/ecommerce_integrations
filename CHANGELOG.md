@@ -10,6 +10,60 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.3] — 2026-05-13
+
+**Baumera zero-errors Phase 2 — 4-bug bundle + ``Sales Order Item.allow_on_submit`` PS.** Companion to ygf-v0.5.2. Trigger: EIL audit 2026-05-13 surfaced 136 ``handle_order_edited`` silent line-drops + three smaller error clusters. See ERPNext workspace `stages/04c-data-sync/working/supplier-sheet-3-issues-2026-05-12/YEI-EIL-AUDIT-AND-PATCH-PLAN.md`.
+
+### Why
+
+| # | Symptom | EIL count |
+|---|---|---|
+| 1 | ``orders/edited`` webhook silently dropped every Shopify line addition since 2026-04-17 (read `payload.get("id")` but the payload nests order_id under `payload["order_edit"]["order_id"]`) | 136 historical Invalid rows |
+| 2 | ``cancel_order`` mis-classified ``TimestampMismatchError`` as the AWB-blocking case (`frappe.db.set_value` bumped SO.modified between read and `.cancel()`) | 8 today |
+| 3 | ``freight_class.py`` `Product.find(product_id)` passed an int → Shopify HTTP 400 "expected String to be a id" | 18 historical |
+
+### Schema bump (metadata only — zero new Custom Fields)
+
+One Property Setter installed by `add_so_item_allow_on_submit` patch:
+
+- `Sales Order.items` (the Table field) → `allow_on_submit=1`. Required so the new ``_reconcile_so_line_items`` helper can ``sales_order.append("items", ...)`` + ``save()`` on submitted SOs. Native precedent: yei-v1.3.2 `Sales Order.shipping_address_name allow_on_submit` Property Setter.
+
+### Code changes
+
+- [`shopify/order.py:handle_order_edited`](ecommerce_integrations/shopify/order.py) — Patch 1: extract order_id from `payload["order_edit"]["order_id"]` (defensive fallback to top-level `id`). Replace ToDo-only body with line-item reconciliation: fetch full order via Shopify REST, diff against `sales_order.items` by `shopify_line_item_id`, append missing SOIs, flag `current_quantity==0` lines via the existing `flag_so_item_refunded` helper. Preserves the audit-trail ToDo as a non-load-bearing trace. Closes 136 EIL Invalid rows.
+- [`shopify/order.py:_reconcile_so_line_items`](ecommerce_integrations/shopify/order.py) — NEW helper (~70 LOC). Idempotent membership check by `shopify_line_item_id`; existing SOIs skipped; new SOIs built via `_build_soi_from_shopify_line`.
+- [`shopify/order.py:_build_soi_from_shopify_line`](ecommerce_integrations/shopify/order.py) — NEW helper (~40 LOC). Mirrors per-row logic in `get_order_items` (B12 / B15 / B24b semantics) for a single Shopify line. Stamps `shopify_line_item_id` so subsequent reconciles see the new row as already-present.
+- [`shopify/order.py:cancel_order`](ecommerce_integrations/shopify/order.py) — Patch 3a: `frappe.db.set_value(..., update_modified=False)` on the ORDER_STATUS_FIELD write so the in-memory `sales_order` doc doesn't go stale before `.cancel()`. Patch 3b: tighten the `frappe.ValidationError` except clause to match on `"FedEx AWB" in str(e)`; non-AWB ValidationErrors (including residual TimestampMismatch) re-raise to the outer Exception handler for accurate diagnostics rather than the misleading "manual intervention required" label. Closes 8 mis-classified EIL Error rows.
+- [`shopify/freight_class.py:make_live_fetcher`](ecommerce_integrations/shopify/freight_class.py) — Patch 4: `Product.find(str(product_id))` to satisfy pyactiveresource string-id requirement. Closes 18 sync_sales_order Shopify-400 errors. Defensive companion at line 174 (`Order.find(str(shopify_order_id))`).
+- [`patches/add_so_item_allow_on_submit.py`](ecommerce_integrations/patches/add_so_item_allow_on_submit.py) — NEW. Single `execute()` calling `frappe.make_property_setter` on `Sales Order.items` table field. Idempotent.
+- [`patches.txt`](ecommerce_integrations/patches.txt) — registers the new patch.
+
+### Tests
+
+23 new tests in `tests/test_supplier_sheet_3_issues.py` (`TestV133*` suite):
+
+- 9 source-invariants on `handle_order_edited` + `_reconcile_so_line_items` + `_build_soi_from_shopify_line` (order_id extraction, reconcile helper present, line-id-based diff, refund flag call, save() flush, line_id stamping).
+- 5 behavioural unit tests on the order_id extraction logic (nested key, top-level fallback, empty payload, non-dict payload, idempotent no-op reconcile).
+- 3 source-invariants on `cancel_order` (update_modified=False, FedEx-AWB match in except, non-AWB re-raises).
+- 2 source-invariants on `freight_class.py` (str(product_id), str(shopify_order_id)).
+- 4 source-invariants on the `add_so_item_allow_on_submit` Property Setter patch.
+
+Total: 289 yei tests (266 baseline + 23 new), 0 regressions.
+
+### Backfill (workspace, post-deploy)
+
+`scripts/backfill_eil_handle_order_edited.py` — NEW. One-shot replay of 136 historical EIL `handle_order_edited` Invalid rows. Per row: extract `order_edit.order_id` from `request_data`; find the SO; fetch full Shopify order; diff lines by `shopify_line_item_id`; (a) flag `current_quantity==0` matches as refunded via `frappe.client.set_value`; (b) delegate additions to the deployed `handle_order_edited` whitelisted method (single source of truth post-deploy). Idempotent (line-id diff is the membership check). Logs to `data/backfills/backfill_eil_handle_order_edited.jsonl`.
+
+### Reversibility
+
+Fully reversible by reverting this commit + redeploying yei-v1.3.2. The Property Setter is metadata-only — no schema mutation. The reconcile helper only adds rows on submitted SOs; rollback path is `frappe.client.delete` on any SOIs stamped with a Shopify line_item_id but absent from the legacy code path (none expected since pre-fix never reconciled).
+
+### Deploy
+
+Bundled with ygf-v0.5.2 in one Press candidate. Defensive pin: frappe `3j5g13nk6q` (16.16.0) + erpnext `a1nmobnt0o` (16.15.1) to current_release. The install patch runs as part of bench migrate.
+
+---
+
 ## [yei-v1.3.2] — 2026-05-13
 
 **Issue #1 backfill unblocker.** Companion to no-ygf-change (ygf stays on `0.5.1`). Single-purpose release: install a Property Setter relaxing `allow_on_submit` on the native `Sales Order.shipping_address_name` field, so the Issue #1 backfill (and any future SO-side address-link mutations) can write on submitted SOs without `UpdateAfterSubmitError`.

@@ -767,8 +767,20 @@ def cancel_order(payload, request_id=None):
 		# Demoted financial-mirror write — keep so the field stays in
 		# sync with Shopify's current financial_status even when
 		# ``.cancel()`` raises below.
+		#
+		# yei-v1.3.3 Patch 3: ``update_modified=False`` so this write
+		# doesn't bump SO.modified on the DB row. Without this, the
+		# in-memory ``sales_order`` object held by this function still
+		# carries the OLD timestamp; ``sales_order.cancel()`` then trips
+		# ``TimestampMismatchError`` via Frappe's ``check_if_latest``,
+		# which used to be caught by the ValidationError clause below
+		# and misreported as "FedEx AWB" / "manual intervention required"
+		# (8 EIL Error rows on 2026-05-13). The field is a diagnostic
+		# mirror of Shopify's financial_status; no downstream code keys
+		# on its modified timestamp.
 		frappe.db.set_value(
 			"Sales Order", sales_order.name, ORDER_STATUS_FIELD, order_status,
+			update_modified=False,
 		)
 
 		if sales_order.docstatus == 1:
@@ -776,11 +788,23 @@ def cancel_order(payload, request_id=None):
 				# alpha26 hook (``ygh_fedex.split.cancel_dns_or_refuse``)
 				# cascades DN.cancel() and refuses if any DN has lr_no
 				# (FedEx AWB minted). The cascade raises
-				# ``frappe.ValidationError`` per D6.
+				# ``frappe.ValidationError`` per D6 with "FedEx AWB" in
+				# the message text.
 				sales_order.cancel()
 			except frappe.ValidationError as e:
-				# 5% edge: DN has AWB → package en route. Customer-service
-				# / refund territory; SO stays at docstatus=1 deliberately.
+				# yei-v1.3.3 Patch 3: tighten the except to genuinely
+				# match the AWB-blocking case ("FedEx AWB" in the
+				# cascade's frappe.throw message). Any other
+				# ValidationError (e.g. lingering TimestampMismatch from
+				# concurrent writes) propagates to the outer Exception
+				# handler so it surfaces as a real Error with diagnostic
+				# detail rather than the misleading "manual intervention
+				# required" label.
+				if "FedEx AWB" not in str(e):
+					raise
+				# True D6 edge: DN has AWB → package en route. Customer-
+				# service / refund territory; SO stays at docstatus=1
+				# deliberately.
 				create_shopify_log(
 					status="Error",
 					message=(
@@ -797,22 +821,35 @@ def cancel_order(payload, request_id=None):
 
 
 def handle_order_edited(payload, request_id=None):
-	"""B13: Handle orders/edited webhook.
+	"""B13 / yei-v1.3.3: Handle ``orders/edited`` webhook.
 
-	Compares the incoming edited order against the existing ERPNext Sales Order.
-	Creates a ToDo (task) for the operator with a human-readable diff.
-	Does NOT auto-modify the SO — operator decides the action.
+	Shopify's ``orders/edited`` payload nests under
+	``payload["order_edit"]["order_id"]`` — NOT a top-level ``id``. Prior
+	versions read ``payload.get("id")`` (None) and silently dropped every
+	line addition (136 EIL Invalid rows since 2026-04-17). This rewrite:
 
-	Covers: warranty parts added, quantity changes, price adjustments,
-	item removals, address changes.
+	* Extracts ``order_id`` from the correct nested key (defensive fallback
+	  to top-level ``id`` for flat replay payloads / older API versions).
+	* Reconciles ``Sales Order.items`` against the current Shopify line
+	  items: inserts SOIs for additions; flags ``current_quantity == 0``
+	  lines as refunded via the existing ``flag_so_item_refunded`` helper.
+	* Falls back to a diff-only ToDo when no actionable changes detected
+	  (legacy audit-trail behaviour preserved for ops review).
+
+	The webhook delta only carries ``{additions, removals}`` of
+	line_item_ids — no SKUs/prices. Full reconciliation requires a Shopify
+	REST fetch of the current order, then a diff by ``shopify_line_item_id``
+	(stamped on every SOI since v1.3.1 via Phase-A backfill).
 	"""
 	frappe.set_user("Administrator")
 	frappe.flags.request_id = request_id
 
-	order = payload
 	try:
-		order_id = order.get("id")
-		sales_order = get_sales_order(order_id)
+		# yei-v1.3.3 Patch 1: read the correct nested key.
+		order_edit = (payload.get("order_edit") if isinstance(payload, dict) else None) or {}
+		order_id = order_edit.get("order_id") or (payload.get("id") if isinstance(payload, dict) else None)
+
+		sales_order = get_sales_order(order_id) if order_id else None
 
 		if not sales_order:
 			create_shopify_log(
@@ -821,54 +858,209 @@ def handle_order_edited(payload, request_id=None):
 			)
 			return
 
-		# Build a diff summary
-		diff_lines = _build_order_edit_diff(sales_order, order)
-
-		if not diff_lines:
-			create_shopify_log(status="Success", message="Order edited but no material changes detected")
+		# Fetch full current state from Shopify — the webhook delta alone
+		# lacks SKUs/prices/titles needed for SOI construction.
+		try:
+			shopify_order_resource = Order.find(str(order_id))
+			full_order = shopify_order_resource.to_dict()
+		except Exception as fetch_err:  # noqa: BLE001
+			create_shopify_log(
+				status="Error",
+				message=f"orders/edited: Shopify REST fetch failed for order {order_id}: {fetch_err}",
+				exception=fetch_err,
+			)
 			return
 
-		# Create a ToDo for the operator
-		diff_text = "\n".join(diff_lines)
-		todo_description = (
-			f"<b>Shopify Order Edited: {order.get('name', order_id)}</b><br><br>"
-			f"<b>Sales Order:</b> {sales_order.name}<br>"
-			f"<b>Customer:</b> {sales_order.customer}<br><br>"
-			f"<b>Changes detected:</b><br><pre>{diff_text}</pre><br><br>"
-			f"<b>Action required:</b> Review and decide whether to amend the SO, "
-			f"create a new SO, or ignore."
-		)
+		added, refunded = _reconcile_so_line_items(sales_order, full_order)
 
-		frappe.get_doc(
-			{
-				"doctype": "ToDo",
-				"description": todo_description,
-				"reference_type": "Sales Order",
-				"reference_name": sales_order.name,
-				"allocated_to": frappe.db.get_single_value(SETTING_DOCTYPE, "owner") or "Administrator",
-				"priority": "Medium",
-			}
-		).insert(ignore_permissions=True)
+		# Audit-trail ToDo (preserves legacy operator-visibility behaviour).
+		diff_lines = _build_order_edit_diff(sales_order, full_order)
+		if diff_lines:
+			diff_text = "\n".join(diff_lines)
+			todo_description = (
+				f"<b>Shopify Order Edited: {full_order.get('name', order_id)}</b><br><br>"
+				f"<b>Sales Order:</b> {sales_order.name}<br>"
+				f"<b>Customer:</b> {sales_order.customer}<br><br>"
+				f"<b>Reconciled:</b> +{len(added)} item(s), {len(refunded)} flagged refunded<br><br>"
+				f"<b>Changes detected:</b><br><pre>{diff_text}</pre>"
+			)
+			try:
+				frappe.get_doc(
+					{
+						"doctype": "ToDo",
+						"description": todo_description,
+						"reference_type": "Sales Order",
+						"reference_name": sales_order.name,
+						"allocated_to": frappe.db.get_single_value(SETTING_DOCTYPE, "owner") or "Administrator",
+						"priority": "Medium",
+					}
+				).insert(ignore_permissions=True)
+			except Exception:  # noqa: BLE001
+				# ToDo is non-load-bearing — don't fail the whole handler over it.
+				pass
 
-		# Update order tags/status if changed
-		new_tags = order.get("tags", "")
+		# Update order tags/status if changed.
+		new_tags = full_order.get("tags", "")
 		if new_tags != (sales_order.get(ORDER_STATUS_FIELD) or ""):
-			frappe.db.set_value("Sales Order", sales_order.name, ORDER_STATUS_FIELD, new_tags)
+			frappe.db.set_value(
+				"Sales Order", sales_order.name, ORDER_STATUS_FIELD, new_tags,
+				update_modified=False,
+			)
 
-		# Update financial/fulfillment status
+		# Update financial/fulfillment status mirror fields.
 		frappe.db.set_value(
 			"Sales Order",
 			sales_order.name,
 			{
-				ORDER_FINANCIAL_STATUS_FIELD: order.get("financial_status") or "",
-				ORDER_FULFILLMENT_STATUS_FIELD: order.get("fulfillment_status") or "",
+				ORDER_FINANCIAL_STATUS_FIELD: full_order.get("financial_status") or "",
+				ORDER_FULFILLMENT_STATUS_FIELD: full_order.get("fulfillment_status") or "",
 			},
+			update_modified=False,
 		)
 
 	except Exception as e:
 		create_shopify_log(status="Error", exception=e)
 	else:
-		create_shopify_log(status="Success")
+		create_shopify_log(
+			status="Success",
+			message=f"orders/edited reconciled: +{len(added)} items, {len(refunded)} refund-flagged",
+		)
+
+
+def _reconcile_so_line_items(sales_order, full_order):
+	"""yei-v1.3.3: reconcile ``sales_order.items`` against the current
+	Shopify lineItems.
+
+	Returns ``(added_skus, refunded_lids)``.
+
+	* New Shopify lines (not on SO by ``shopify_line_item_id``) → append a
+	  new SOI built from the Shopify line via ``_build_soi_from_shopify_line``.
+	* Lines with ``current_quantity == 0`` that are on the SO → flag via
+	  ``flag_so_item_refunded`` (idempotent; respects existing flag).
+	* Idempotent: re-runs are no-ops since both branches are guarded by
+	  membership / flag checks.
+
+	Requires Property Setter ``Sales Order Item.allow_on_submit=1`` so the
+	``save()`` call on a submitted SO doesn't raise
+	``UpdateAfterSubmitError`` for the new child rows. Installed by patch
+	``add_so_item_allow_on_submit`` (yei-v1.3.3).
+	"""
+	from ecommerce_integrations.shopify.refund import flag_so_item_refunded
+
+	setting = frappe.get_doc(SETTING_DOCTYPE)
+	shopify_lines = full_order.get("line_items") or []
+
+	# Existing SOI index by shopify_line_item_id (stamped since v1.3.1).
+	existing_by_lid = {}
+	for soi in sales_order.items:
+		lid = (soi.get(LINE_ITEM_ID_FIELD) or "")
+		if lid:
+			existing_by_lid[str(lid)] = soi
+
+	added = []
+	refunded = []
+	taxes_inclusive = cint(getattr(setting, "taxes_inclusive", 0))
+	now = nowdate()
+
+	for li in shopify_lines:
+		lid = str(li.get("id") or "")
+		cq = cint(li.get("current_quantity", li.get("quantity", 1)))
+
+		# Skip tip lines (mirror B9 behaviour in get_order_items).
+		title = str(li.get("title") or "").strip().lower()
+		if title == "tip":
+			continue
+
+		if cq == 0:
+			# Refund territory — flag if present on the SO; skip if not (line
+			# was added then fully refunded before reconcile — nothing to do).
+			soi = existing_by_lid.get(lid)
+			if soi and not cint(soi.get("shopify_refunded") or 0):
+				flag_so_item_refunded(sales_order.name, soi.name, now)
+				refunded.append(lid)
+			continue
+
+		if lid and lid in existing_by_lid:
+			continue  # Already on the SO.
+
+		# New line — build an SOI row from the Shopify line.
+		new_row = _build_soi_from_shopify_line(li, setting, sales_order, taxes_inclusive)
+		if new_row:
+			sales_order.append("items", new_row)
+			added.append(new_row.get("item_code"))
+
+	if added:
+		# Required to flush new child rows. Property Setter
+		# Sales Order Item.allow_on_submit=1 unblocks the submit-time write.
+		sales_order.save(ignore_permissions=True)
+
+	return added, refunded
+
+
+def _build_soi_from_shopify_line(shopify_item, setting, sales_order, taxes_inclusive):
+	"""yei-v1.3.3: build a single SOI dict from a Shopify line_item.
+
+	Mirrors per-row logic in ``get_order_items`` (B12 / B15 / B24b semantics)
+	without re-walking the full order. Returns ``None`` if the line is a
+	tip / unfillable / current_quantity == 0 (caller already filters these
+	but defensive).
+	"""
+	current_qty = cint(
+		shopify_item.get("current_quantity", shopify_item.get("quantity", 1))
+	)
+	if current_qty == 0:
+		return None
+
+	item_code = None
+	if shopify_item.get("product_exists") and shopify_item.get("product_id"):
+		item_code = get_item_code(shopify_item)
+	if not item_code:
+		item_code = UNMATCHED_ITEM_CODE
+		_ensure_misc_manual_item(setting)
+
+	properties = shopify_item.get("properties") or []
+	properties_json = json.dumps(properties) if properties else ""
+
+	price = flt(shopify_item.get("price"))
+	qty = current_qty
+	total_discount = _get_total_discount(shopify_item)
+	per_unit_discount = total_discount / qty if qty else 0.0
+
+	if taxes_inclusive:
+		per_unit_tax = sum(
+			flt(tax.get("price")) for tax in (shopify_item.get("tax_lines") or [])
+		) / qty if qty else 0.0
+	else:
+		per_unit_tax = 0.0
+
+	effective_rate = price - per_unit_tax - per_unit_discount
+
+	line_item_id = shopify_item.get("id")
+	# Derive delivery_date from the parent SO so the new row aligns with
+	# existing line semantics (ERPNext requires per-row delivery_date).
+	delivery_date = sales_order.get("delivery_date") or nowdate()
+
+	row = {
+		"item_code": item_code,
+		"item_name": shopify_item.get("name") or shopify_item.get("title"),
+		"rate": effective_rate,
+		"price_list_rate": effective_rate,
+		"delivery_date": delivery_date,
+		"qty": qty,
+		"stock_uom": shopify_item.get("uom") or "Nos",
+		"warehouse": setting.warehouse,
+		ORDER_ITEM_PROPERTIES_FIELD: properties_json,
+		LINE_ITEM_ID_FIELD: str(line_item_id) if line_item_id is not None else "",
+	}
+
+	if item_code == UNMATCHED_ITEM_CODE:
+		row["description"] = (
+			f"[UNMATCHED] {shopify_item.get('title', '')} "
+			f"(Shopify product_id: {shopify_item.get('product_id', 'N/A')}, "
+			f"variant_id: {shopify_item.get('variant_id', 'N/A')})"
+		)
+
+	return row
 
 
 def _build_order_edit_diff(sales_order, shopify_order):

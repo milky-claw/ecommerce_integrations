@@ -171,7 +171,11 @@ def recompute_for_so(so_name, fetcher=None):
 	from shopify.resources import Order
 
 	try:
-		shopify_order = Order.find(shopify_order_id)
+		# yei-v1.3.3 Patch 4 (defensive): Shopify pyactiveresource REST
+		# layer requires string ids — ints raise 400
+		# "expected String to be a id". Same fix as the make_live_fetcher
+		# Product.find call site below.
+		shopify_order = Order.find(str(shopify_order_id))
 		line_items = shopify_order.attributes.get("line_items") or []
 		# Convert to plain dicts (PaginatedIterator returns Resource objects)
 		line_payload = [
@@ -259,7 +263,12 @@ def make_live_fetcher():
 		from shopify.resources import Product
 
 		try:
-			product = Product.find(product_id)
+			# yei-v1.3.3 Patch 4: Shopify pyactiveresource REST layer
+			# rejects integer ids with HTTP 400 "expected String to be
+			# a id". The order payload delivers product_id as a JSON
+			# integer; cast to str before lookup. Closes 18 historical
+			# sync_sales_order Shopify-400 errors.
+			product = Product.find(str(product_id))
 			raw = (getattr(product, "tags", None) or "")
 			tags = [t.strip() for t in raw.split(",") if t.strip()]
 		except Exception as e:  # noqa: BLE001

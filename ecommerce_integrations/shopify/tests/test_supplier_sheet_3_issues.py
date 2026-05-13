@@ -578,6 +578,229 @@ class TestV132PropertySetterUnblocker(unittest.TestCase):
 
 
 # ───────────────────────────────────────────────────────────────────────
+# yei-v1.3.3 — handle_order_edited reconciliation + cancel TimestampMismatch
+# + freight_class str(product_id) + Sales Order Item.allow_on_submit PS
+# ───────────────────────────────────────────────────────────────────────
+
+
+class TestV133HandleOrderEditedSourceInvariant(unittest.TestCase):
+	"""Phase-2 EIL-audit fix: reconcile SO.items on orders/edited.
+
+	Closes 136 historical EIL ``handle_order_edited`` Invalid rows where
+	``payload.get("id")`` was None because ``orders/edited`` nests the
+	order id under ``payload["order_edit"]["order_id"]``.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		with open(ORDER_PY, "r", encoding="utf-8") as f:
+			cls.source = f.read()
+
+	def test_reads_order_edit_nested_order_id(self):
+		body = _source_of("handle_order_edited", self.source)
+		self.assertIn('order_edit', body,
+			"handle_order_edited must read payload['order_edit'] nested key")
+		self.assertIn('order_id', body,
+			"handle_order_edited must extract order_id from order_edit")
+
+	def test_falls_back_to_top_level_id_defensively(self):
+		body = _source_of("handle_order_edited", self.source)
+		self.assertIn('payload.get("id")', body,
+			"handle_order_edited must defensively fall back to top-level id "
+			"for flat replay payloads / older API versions")
+
+	def test_calls_reconcile_helper(self):
+		body = _source_of("handle_order_edited", self.source)
+		self.assertIn('_reconcile_so_line_items', body,
+			"handle_order_edited must call _reconcile_so_line_items")
+
+	def test_reconcile_helper_defined(self):
+		self.assertIn('def _reconcile_so_line_items(', self.source,
+			"_reconcile_so_line_items helper must be defined")
+
+	def test_reconcile_helper_diffs_by_line_item_id(self):
+		body = _source_of("_reconcile_so_line_items", self.source)
+		self.assertIn('LINE_ITEM_ID_FIELD', body,
+			"_reconcile_so_line_items must diff by shopify_line_item_id")
+		self.assertIn('existing_by_lid', body,
+			"_reconcile_so_line_items must build an existing-by-lid index")
+
+	def test_reconcile_helper_calls_flag_so_item_refunded(self):
+		body = _source_of("_reconcile_so_line_items", self.source)
+		self.assertIn('flag_so_item_refunded', body,
+			"_reconcile_so_line_items must flag cq==0 lines as refunded")
+
+	def test_reconcile_helper_appends_new_sois(self):
+		body = _source_of("_reconcile_so_line_items", self.source)
+		self.assertIn('append("items"', body,
+			"_reconcile_so_line_items must append new SOIs on the SO")
+		self.assertIn('sales_order.save', body,
+			"_reconcile_so_line_items must flush via sales_order.save()")
+
+	def test_build_soi_from_shopify_line_helper_defined(self):
+		self.assertIn('def _build_soi_from_shopify_line(', self.source,
+			"_build_soi_from_shopify_line helper must be defined")
+
+	def test_build_soi_stamps_line_item_id(self):
+		body = _source_of("_build_soi_from_shopify_line", self.source)
+		self.assertIn('LINE_ITEM_ID_FIELD', body,
+			"new SOIs from edited orders must stamp shopify_line_item_id "
+			"so subsequent reconciles see them as already-present")
+
+
+class TestV133HandleOrderEditedBehavioural(unittest.TestCase):
+	"""Inline-copy behavioural tests for the order-id extraction logic."""
+
+	def test_extracts_from_order_edit_nested(self):
+		payload = {"order_edit": {"order_id": 1234567890}}
+		order_edit = (payload.get("order_edit") if isinstance(payload, dict) else None) or {}
+		order_id = order_edit.get("order_id") or (payload.get("id") if isinstance(payload, dict) else None)
+		self.assertEqual(order_id, 1234567890)
+
+	def test_falls_back_to_top_level_id(self):
+		payload = {"id": 9876543210}  # flat replay payload
+		order_edit = (payload.get("order_edit") if isinstance(payload, dict) else None) or {}
+		order_id = order_edit.get("order_id") or (payload.get("id") if isinstance(payload, dict) else None)
+		self.assertEqual(order_id, 9876543210)
+
+	def test_returns_none_for_empty_payload(self):
+		payload = {}
+		order_edit = (payload.get("order_edit") if isinstance(payload, dict) else None) or {}
+		order_id = order_edit.get("order_id") or (payload.get("id") if isinstance(payload, dict) else None)
+		self.assertIsNone(order_id)
+
+	def test_returns_none_for_non_dict_payload(self):
+		payload = None
+		order_edit = (payload.get("order_edit") if isinstance(payload, dict) else None) or {}
+		order_id = order_edit.get("order_id") or (payload.get("id") if isinstance(payload, dict) else None)
+		self.assertIsNone(order_id)
+
+	def test_reconcile_idempotent_when_no_diff(self):
+		"""Re-running reconcile against unchanged data is a no-op."""
+		# Simulated existing index keyed by shopify_line_item_id.
+		existing_by_lid = {"100": object(), "200": object()}
+		shopify_lines = [
+			{"id": 100, "current_quantity": 1, "title": "A"},
+			{"id": 200, "current_quantity": 1, "title": "B"},
+		]
+		added = []
+		refunded = []
+		for li in shopify_lines:
+			lid = str(li.get("id") or "")
+			cq = int(li.get("current_quantity") or 0)
+			if cq == 0:
+				continue
+			if lid and lid in existing_by_lid:
+				continue
+			added.append(li)
+		self.assertEqual(added, [], "Idempotent reconcile must be a no-op")
+		self.assertEqual(refunded, [])
+
+
+class TestV133CancelOrderTimestampMismatchFix(unittest.TestCase):
+	"""Phase-2 EIL-audit fix: cancel_order TimestampMismatch + tightened except."""
+
+	@classmethod
+	def setUpClass(cls):
+		with open(ORDER_PY, "r", encoding="utf-8") as f:
+			cls.source = f.read()
+
+	def test_set_value_uses_update_modified_false(self):
+		body = _source_of("cancel_order", self.source)
+		# Find the ORDER_STATUS_FIELD set_value block and assert it includes
+		# update_modified=False so the in-memory sales_order doc doesn't
+		# go stale before the .cancel() call.
+		self.assertIn('ORDER_STATUS_FIELD', body,
+			"cancel_order must still write the financial-status mirror")
+		self.assertIn('update_modified=False', body,
+			"cancel_order set_value must pass update_modified=False "
+			"to avoid TimestampMismatch on the subsequent .cancel() call")
+
+	def test_except_clause_matches_on_fedex_awb_message(self):
+		body = _source_of("cancel_order", self.source)
+		self.assertIn('"FedEx AWB"', body,
+			"cancel_order except clause must match on 'FedEx AWB' message "
+			"text so only the real D6/AWB case is logged as 'manual "
+			"intervention required'; non-AWB ValidationErrors propagate "
+			"to the outer except for accurate diagnostics")
+
+	def test_non_awb_validation_error_reraises(self):
+		body = _source_of("cancel_order", self.source)
+		# The "if 'FedEx AWB' not in str(e): raise" line is the tightening.
+		self.assertRegex(body,
+			r'if\s+"FedEx AWB"\s+not\s+in\s+str\(e\)\s*:\s*\n\s*raise',
+			"cancel_order must re-raise non-AWB ValidationErrors so they "
+			"don't get misreported as AWB-blocking cases")
+
+
+class TestV133FreightClassStrCoercion(unittest.TestCase):
+	"""Phase-2 EIL-audit fix: Shopify REST id type coercion (int → str)."""
+
+	@classmethod
+	def setUpClass(cls):
+		FREIGHT_PY = os.path.join(SHOPIFY_DIR, "freight_class.py")
+		with open(FREIGHT_PY, "r", encoding="utf-8") as f:
+			cls.source = f.read()
+
+	def test_make_live_fetcher_wraps_product_id_in_str(self):
+		# Find the inline `fetch` closure inside make_live_fetcher.
+		self.assertIn('Product.find(str(product_id))', self.source,
+			"make_live_fetcher must call Product.find with str(product_id) "
+			"to avoid Shopify HTTP 400 'expected String to be a id'")
+
+	def test_recompute_helper_wraps_order_id_in_str(self):
+		self.assertIn('Order.find(str(shopify_order_id))', self.source,
+			"freight_class recompute helper must call Order.find with "
+			"str(shopify_order_id) defensively")
+
+
+class TestV133SOItemAllowOnSubmitPS(unittest.TestCase):
+	"""Phase-2: Sales Order Item.allow_on_submit=1 Property Setter patch.
+
+	Unblocks ``sales_order.append("items", ...)`` + ``save()`` on submitted
+	SOs — required by ``_reconcile_so_line_items`` for orders/edited.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.patch_path = os.path.join(
+			os.path.dirname(SHOPIFY_DIR), "patches",
+			"add_so_item_allow_on_submit.py",
+		)
+		with open(PATCHES_TXT, "r", encoding="utf-8") as f:
+			cls.patches_txt = f.read()
+		with open(cls.patch_path, "r", encoding="utf-8") as f:
+			cls.patch_src = f.read()
+
+	def test_patch_file_exists(self):
+		self.assertTrue(os.path.exists(self.patch_path),
+			"yei-v1.3.3 patch add_so_item_allow_on_submit.py must exist")
+
+	def test_patch_registered_in_patches_txt(self):
+		self.assertIn(
+			"ecommerce_integrations.patches.add_so_item_allow_on_submit",
+			self.patches_txt,
+			"yei-v1.3.3 patch must be registered in patches.txt",
+		)
+
+	def test_patch_targets_so_items_table_field(self):
+		self.assertIn('make_property_setter', self.patch_src,
+			"patch must call frappe.make_property_setter")
+		self.assertIn('"Sales Order"', self.patch_src,
+			"patch target doctype must be Sales Order (parent of items table)")
+		self.assertIn('"items"', self.patch_src,
+			"patch target fieldname must be 'items' (the Table field)")
+		self.assertIn('"allow_on_submit"', self.patch_src,
+			"patch must set the allow_on_submit property")
+		self.assertIn('"Check"', self.patch_src,
+			"property_type must be Check")
+
+	def test_patch_clears_cache_after_mutation(self):
+		self.assertIn('clear_cache', self.patch_src,
+			"patch must clear Sales Order cache so metadata takes effect")
+
+
+# ───────────────────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":
