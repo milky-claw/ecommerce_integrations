@@ -526,6 +526,58 @@ class TestIssue3CancelOrderSourceInvariant(unittest.TestCase):
 
 
 # ───────────────────────────────────────────────────────────────────────
+# yei-v1.3.2 — Property Setter unblocker for Issue #1 backfill
+# ───────────────────────────────────────────────────────────────────────
+
+
+class TestV132PropertySetterUnblocker(unittest.TestCase):
+	"""Verifies the yei-v1.3.2 Property Setter patch + registration.
+
+	Property Setter ``Sales Order.shipping_address_name allow_on_submit=1``
+	is the Frappe-native surface for relaxing a DocField attribute on a
+	non-Custom-Field. Direct precedent: ``relabel_alpha26_dn_lr_fields.py``.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.patch_path = os.path.join(
+			os.path.dirname(SHOPIFY_DIR), "patches",
+			"add_so_shipping_address_name_allow_on_submit.py",
+		)
+		with open(PATCHES_TXT, "r", encoding="utf-8") as f:
+			cls.patches_txt = f.read()
+		with open(cls.patch_path, "r", encoding="utf-8") as f:
+			cls.patch_src = f.read()
+
+	def test_patch_file_exists(self):
+		self.assertTrue(os.path.exists(self.patch_path),
+			"yei-v1.3.2 patch add_so_shipping_address_name_allow_on_submit.py must exist")
+
+	def test_patch_registered_in_patches_txt(self):
+		self.assertIn(
+			"ecommerce_integrations.patches.add_so_shipping_address_name_allow_on_submit",
+			self.patches_txt,
+			"yei-v1.3.2 patch must be registered in patches.txt",
+		)
+
+	def test_patch_calls_make_property_setter_on_correct_field(self):
+		self.assertIn("make_property_setter", self.patch_src,
+			"patch must call frappe.make_property_setter")
+		self.assertIn('"Sales Order"', self.patch_src,
+			"patch target doctype must be Sales Order")
+		self.assertIn('"shipping_address_name"', self.patch_src,
+			"patch target fieldname must be shipping_address_name")
+		self.assertIn('"allow_on_submit"', self.patch_src,
+			"patch must set the allow_on_submit property")
+		self.assertIn('"Check"', self.patch_src,
+			"property_type must be Check (matches DocField.allow_on_submit)")
+
+	def test_patch_clears_cache_after_mutation(self):
+		self.assertIn("clear_cache", self.patch_src,
+			"patch must clear Sales Order cache so the new metadata takes effect")
+
+
+# ───────────────────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":

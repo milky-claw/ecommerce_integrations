@@ -10,6 +10,46 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.2] — 2026-05-13
+
+**Issue #1 backfill unblocker.** Companion to no-ygf-change (ygf stays on `0.5.1`). Single-purpose release: install a Property Setter relaxing `allow_on_submit` on the native `Sales Order.shipping_address_name` field, so the Issue #1 backfill (and any future SO-side address-link mutations) can write on submitted SOs without `UpdateAfterSubmitError`.
+
+### Why
+
+The v1.3.1 Issue #1 backfill attempted to CREATE a new per-order Address record + repoint `Sales Order.shipping_address_name` at it. The second step raised `frappe.exceptions.UpdateAfterSubmitError` because the native Frappe field has `allow_on_submit=0`. All 33 candidates errored on apply — 24 docstatus=1 (blocked by allow_on_submit) and 9 docstatus=2 (blocked by docstatus). 33 orphan Address records left behind (harmless; no SO points at them).
+
+Research design at `ERPNext/stages/04c-data-sync/working/supplier-sheet-3-issues-2026-05-12/RESEARCH-v1.3.2-unblocker.md` recommended Option B (edit-in-place on the existing Address record — non-submittable, works for both docstatus scopes) PLUS Option A (Property Setter) as defensive backstop for the <5% non-unique-Address fallback path and for any future SO-side mutation flow. yei-v1.3.2 ships the Property Setter half; the backfill script half lives in the workspace.
+
+### Schema bump
+
+Zero new Custom Fields. Property Setter is metadata-only — no `ALTER TABLE`. Same shape as the `ygh_fedex/patches/relabel_alpha26_dn_lr_fields.py` precedent (alpha26 `lr_no` relabel).
+
+### Code changes
+
+- [`patches/add_so_shipping_address_name_allow_on_submit.py`](ecommerce_integrations/patches/add_so_shipping_address_name_allow_on_submit.py) — NEW. Single `execute()` calling `frappe.make_property_setter({"doctype":"Sales Order", "fieldname":"shipping_address_name", "property":"allow_on_submit", "value":"1", "property_type":"Check"})` + `frappe.clear_cache(doctype="Sales Order")`. Idempotent (`make_property_setter` upserts by `(doctype, fieldname, property)`).
+- [`patches.txt`](ecommerce_integrations/patches.txt) — registers the new patch in the v1_3 section.
+
+### Tests
+
+4 new tests in `tests/test_supplier_sheet_3_issues.py` (`TestV132PropertySetterUnblocker`):
+
+- `test_patch_file_exists` — patch module present at expected path.
+- `test_patch_registered_in_patches_txt` — patches.txt picks it up at migrate time.
+- `test_patch_calls_make_property_setter_on_correct_field` — target = `Sales Order.shipping_address_name.allow_on_submit`, property_type = `Check`.
+- `test_patch_clears_cache_after_mutation` — `clear_cache(doctype="Sales Order")` is called so the new metadata takes effect immediately.
+
+Total: 266 yei tests (262 baseline → 266), 0 regressions.
+
+### Backfill (workspace, post-deploy)
+
+`scripts/backfill_issue1_per_order_addresses_v132.py` — NEW. Pivots from "create new Address + repoint SO" to "edit-in-place on the existing Address record". Walks Shopify-sourced SOs at docstatus=1 OR docstatus=2 with a populated `shipping_address_name`; for each, compares the current Address fields to Shopify's `shipping_address.first_name + " " + last_name` (plus all geographic + phone fields); pre-checks uniqueness (`get_count` on Sales Order + Delivery Note linking to the Address must equal 1 SO and ≤ own DN count); writes only the differing fields via `frappe.client.set_value` on the Address doctype (non-submittable — works for both docstatus scopes); idempotent. Does NOT update `Sales Order.shipping_address_name` (avoids the allow_on_submit issue entirely). Does NOT create new Address records (avoids the 33-orphan trap).
+
+### Deploy
+
+Single Press candidate for yei-v1.3.2 alone (ygf untouched). Defensive pin: frappe `3j5g13nk6q` (16.16.0) + erpnext `a1nmobnt0o` (16.15.1) + ygf `5s2aoo5a4b` (0.5.1) to current_release.
+
+---
+
 ## [yei-v1.3.1] — 2026-05-13
 
 **Supplier-sheet 3-issue fix bundle (Issues #1, #2, #3).** Companion to ygf-v0.5.1. Trigger: Baumera-YGH + Palmako sheet audits, plus the 2026-05-13 Preorder investigation that reframed Issue #2's root cause from "preorder filter miss" to "refund-match SKU translation bug + B5 line-id capture broken in production."
