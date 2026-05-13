@@ -21,15 +21,17 @@ The clean path is a thin admin-callable wrapper that delegates to the existing h
 ### Code changes
 
 - [`shopify/order.py:replay_handle_order_edited`](ecommerce_integrations/shopify/order.py) — NEW `@frappe.whitelist()` + `@temp_shopify_session` wrapper. Builds a synthetic ``{"order_edit": {"order_id": str(...)}}`` payload and delegates to ``handle_order_edited``. Permission gate: System Manager role or session user = Administrator (bypasses HMAC validation that ``_validate_request`` does for live webhooks; admin-role is the explicit trust boundary). ``@temp_shopify_session`` establishes the Shopify auth session so the handler's ``Order.find()`` REST call succeeds — live webhook flow gets its session via ``_validate_request`` (in the webhook entry point), which the wrapper bypasses. ``request_id`` is passed through as-is — if ``None``, ``create_shopify_log`` creates a fresh EIL row; forging a fake value breaks the downstream lookup with ``DoesNotExistError``. No new doctypes, no new Custom Fields, no Property Setters — pure code addition.
+- [`shopify/order.py:_build_soi_from_shopify_line`](ecommerce_integrations/shopify/order.py) — yei-v1.3.3 latent bug surfaced by v1.3.4 backfill: ``append+save`` on a submitted parent SO does NOT autofill ``uom`` + ``conversion_factor`` the way fresh-doc insert does (the validate hook that copies them from ``Item.stock_uom`` is bypassed under the allow_on_submit code path). Set ``uom = stock_uom`` and ``conversion_factor = 1.0`` explicitly. Closes "Value missing for: UOM" / "Value missing for: UOM Conversion Factor" errors that were causing the reconciler to fail silently (the handler caught the exception in ``except Exception``; the row never inserted but `replay_handle_order_edited` returned `{}` to the caller).
 
 ### Tests
 
-12 new tests in `tests/test_supplier_sheet_3_issues.py` (`TestV134*` suite):
+13 new tests in `tests/test_supplier_sheet_3_issues.py` (`TestV134*` suite + 1 in `TestV133HandleOrderEditedSourceInvariant`):
 
 - 7 source-invariants on `replay_handle_order_edited` (function defined, @frappe.whitelist + @temp_shopify_session stack, dedicated @temp_shopify_session check, System Manager / Administrator gate, synthetic order_edit payload shape, delegates to handle_order_edited not duplicated logic, request_id passthrough not forged).
 - 5 behavioural unit tests (admin check passes for SM / Administrator, blocks regular user; synthetic payload extraction matches handle_order_edited's logic; idempotent no-op for in-sync SO).
+- 1 source-invariant on `_build_soi_from_shopify_line` locking in `uom` + `conversion_factor` explicit set.
 
-Total: 301 yei tests (289 baseline + 12 new), 0 regressions.
+Total: 302 yei tests (289 baseline + 13 new), 0 regressions.
 
 ### Backfill (workspace, post-deploy)
 

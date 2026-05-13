@@ -1072,6 +1072,12 @@ def _build_soi_from_shopify_line(shopify_item, setting, sales_order, taxes_inclu
 	# existing line semantics (ERPNext requires per-row delivery_date).
 	delivery_date = sales_order.get("delivery_date") or nowdate()
 
+	# yei-v1.3.4 hotfix: append+save on a submitted parent SO does not
+	# autofill ``uom`` + ``conversion_factor`` the way fresh-doc insert
+	# does (the validate hook that would copy from Item.stock_uom is
+	# bypassed under the allow_on_submit code path). Set them explicitly
+	# so the new SOI rows pass validation.
+	stock_uom = shopify_item.get("uom") or "Nos"
 	row = {
 		"item_code": item_code,
 		"item_name": shopify_item.get("name") or shopify_item.get("title"),
@@ -1079,7 +1085,9 @@ def _build_soi_from_shopify_line(shopify_item, setting, sales_order, taxes_inclu
 		"price_list_rate": effective_rate,
 		"delivery_date": delivery_date,
 		"qty": qty,
-		"stock_uom": shopify_item.get("uom") or "Nos",
+		"stock_uom": stock_uom,
+		"uom": stock_uom,
+		"conversion_factor": 1.0,
 		"warehouse": setting.warehouse,
 		ORDER_ITEM_PROPERTIES_FIELD: properties_json,
 		LINE_ITEM_ID_FIELD: str(line_item_id) if line_item_id is not None else "",

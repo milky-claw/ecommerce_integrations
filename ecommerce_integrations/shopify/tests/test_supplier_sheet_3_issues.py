@@ -647,6 +647,21 @@ class TestV133HandleOrderEditedSourceInvariant(unittest.TestCase):
 			"new SOIs from edited orders must stamp shopify_line_item_id "
 			"so subsequent reconciles see them as already-present")
 
+	def test_build_soi_sets_uom_and_conversion_factor(self):
+		"""yei-v1.3.4: append+save on submitted parent doesn't autofill
+		``uom`` + ``conversion_factor`` (the validate hook that copies them
+		from ``Item.stock_uom`` is bypassed under the allow_on_submit code
+		path). Backfill calls EIL with 'Value missing for: UOM' / 'Value
+		missing for: UOM Conversion Factor' until these are set explicitly."""
+		body = _source_of("_build_soi_from_shopify_line", self.source)
+		self.assertIn('"uom"', body,
+			"_build_soi_from_shopify_line must set 'uom' explicitly so "
+			"submit-time SOI insertion doesn't fail on 'Value missing for: UOM'")
+		self.assertIn('"conversion_factor"', body,
+			"_build_soi_from_shopify_line must set 'conversion_factor' "
+			"explicitly so submit-time SOI insertion doesn't fail on "
+			"'Value missing for: UOM Conversion Factor'")
+
 
 class TestV133HandleOrderEditedBehavioural(unittest.TestCase):
 	"""Inline-copy behavioural tests for the order-id extraction logic."""
