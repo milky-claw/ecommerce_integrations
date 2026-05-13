@@ -927,6 +927,24 @@ def handle_order_edited(payload, request_id=None):
 		)
 
 
+@frappe.whitelist()
+def replay_handle_order_edited(shopify_order_id, request_id=None):
+	"""yei-v1.3.4: Admin-only entry point for backfilling historical
+	``orders/edited`` webhook drops.
+
+	Wraps ``handle_order_edited`` with a synthetic ``order_edit`` payload.
+	Caller must hold System Manager (or be Administrator). Idempotent:
+	``_reconcile_so_line_items`` skips lines already present.
+
+	Bypasses the HMAC validation that ``_validate_request`` does for live
+	webhooks; the admin-role gate is the explicit trust boundary.
+	"""
+	if "System Manager" not in frappe.get_roles() and frappe.session.user != "Administrator":
+		frappe.throw(_("System Manager role required for replay_handle_order_edited"))
+	synthetic = {"order_edit": {"order_id": str(shopify_order_id)}}
+	return handle_order_edited(synthetic, request_id=request_id or f"backfill-{frappe.utils.now()}")
+
+
 def _reconcile_so_line_items(sales_order, full_order):
 	"""yei-v1.3.3: reconcile ``sales_order.items`` against the current
 	Shopify lineItems.

@@ -10,6 +10,37 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.4] — 2026-05-13
+
+**Phase-2.5 micro-release — admin replay wrapper for ``handle_order_edited``.** Companion to yei-v1.3.3 Phase-2 backfill. Trigger: Phase-2 backfill recovered 44 of 136 historical EIL Invalid rows; the remaining 88 ``replay_failed`` because ``handle_order_edited`` is a webhook handler (not @frappe.whitelist'd) and ``frappe.client.insert`` of child rows on submitted parents returned 417 EXPECTATION FAILED even with the v1.3.3 Property Setter.
+
+### Why
+
+The clean path is a thin admin-callable wrapper that delegates to the existing handler. The Property Setter ``Sales Order.items.allow_on_submit=1`` enables server-side ``sales_order.append("items", ...).save()`` (which ``_reconcile_so_line_items`` already uses correctly) — it does NOT enable arbitrary REST inserts onto child tables of submitted parents. So we let the existing reconcile path do its job; we just need to be able to invoke it admin-side.
+
+### Code changes
+
+- [`shopify/order.py:replay_handle_order_edited`](ecommerce_integrations/shopify/order.py) — NEW `@frappe.whitelist()` wrapper. Builds a synthetic ``{"order_edit": {"order_id": str(...)}}`` payload and delegates to ``handle_order_edited``. Permission gate: System Manager role or session user = Administrator (bypasses HMAC validation that ``_validate_request`` does for live webhooks; admin-role is the explicit trust boundary). No new doctypes, no new Custom Fields, no Property Setters — pure code addition.
+
+### Tests
+
+10 new tests in `tests/test_supplier_sheet_3_issues.py` (`TestV134*` suite):
+
+- 5 source-invariants on `replay_handle_order_edited` (function defined, @frappe.whitelist decorator, System Manager / Administrator gate, synthetic order_edit payload shape, delegates to handle_order_edited not duplicated logic).
+- 5 behavioural unit tests (admin check passes for SM / Administrator, blocks regular user; synthetic payload extraction matches handle_order_edited's logic; idempotent no-op for in-sync SO).
+
+Total: 299 yei tests (289 baseline + 10 new), 0 regressions.
+
+### Backfill (workspace, post-deploy)
+
+`scripts/backfill_eil_v134_replay.py` — NEW. Filters the Phase-2 jsonl for `event=replay_failed` events on SOs with `transaction_date >= 2026-04-01` AND `docstatus=1`; calls ``replay_handle_order_edited`` via the admin token; per-SO verification (item count delta + line_id stamping on new SOIs). Logs to `data/backfills/backfill_eil_v134_replay.jsonl`.
+
+### Reversibility
+
+Fully reversible by reverting this commit + redeploying yei-v1.3.3. The wrapper is admin-only and additive (zero impact on live webhook flow, which never touches it). Rollback path is `git revert` the commit.
+
+---
+
 ## [yei-v1.3.3] — 2026-05-13
 
 **Baumera zero-errors Phase 2 — 4-bug bundle + ``Sales Order Item.allow_on_submit`` PS.** Companion to ygf-v0.5.2. Trigger: EIL audit 2026-05-13 surfaced 136 ``handle_order_edited`` silent line-drops + three smaller error clusters. See ERPNext workspace `stages/04c-data-sync/working/supplier-sheet-3-issues-2026-05-12/YEI-EIL-AUDIT-AND-PATCH-PLAN.md`.

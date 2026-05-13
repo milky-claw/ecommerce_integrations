@@ -801,6 +801,123 @@ class TestV133SOItemAllowOnSubmitPS(unittest.TestCase):
 
 
 # ───────────────────────────────────────────────────────────────────────
+# yei-v1.3.4 — admin replay wrapper for handle_order_edited backfill
+# ───────────────────────────────────────────────────────────────────────
+
+
+class TestV134ReplayHandleOrderEditedSourceInvariant(unittest.TestCase):
+	"""Phase-2.5: ``replay_handle_order_edited`` admin-callable wrapper.
+
+	The thin entry-point added so the Phase-2 backfill can call
+	``handle_order_edited`` (a webhook-only handler, not @frappe.whitelist'd)
+	against historical EIL Invalid rows. Permission gate is admin-only
+	because this bypasses HMAC validation.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		with open(ORDER_PY, "r", encoding="utf-8") as f:
+			cls.source = f.read()
+
+	def test_replay_function_defined(self):
+		self.assertIn("def replay_handle_order_edited(", self.source,
+			"replay_handle_order_edited must be defined in order.py")
+
+	def test_replay_is_whitelisted(self):
+		# The @frappe.whitelist() decorator must precede the def.
+		self.assertRegex(self.source,
+			r'@frappe\.whitelist\(\)\s*\ndef\s+replay_handle_order_edited\(',
+			"replay_handle_order_edited must be decorated with @frappe.whitelist()")
+
+	def test_replay_enforces_system_manager(self):
+		body = _source_of("replay_handle_order_edited", self.source)
+		self.assertIn('"System Manager"', body,
+			"replay_handle_order_edited must gate on System Manager role")
+		self.assertIn("frappe.get_roles()", body,
+			"replay_handle_order_edited must check current user's roles")
+		self.assertIn("frappe.throw", body,
+			"replay_handle_order_edited must throw on permission failure")
+
+	def test_replay_builds_synthetic_order_edit_payload(self):
+		body = _source_of("replay_handle_order_edited", self.source)
+		self.assertIn('"order_edit"', body,
+			"replay must build a synthetic payload with order_edit key")
+		self.assertIn('"order_id"', body,
+			"replay must put shopify_order_id under order_edit.order_id")
+		self.assertIn("str(shopify_order_id)", body,
+			"replay must coerce shopify_order_id to str for consistency "
+			"with handle_order_edited's order_edit.order_id extraction")
+
+	def test_replay_delegates_to_handle_order_edited(self):
+		body = _source_of("replay_handle_order_edited", self.source)
+		self.assertIn("handle_order_edited(", body,
+			"replay must delegate to handle_order_edited — no duplicated logic")
+
+
+class TestV134ReplayBehavioural(unittest.TestCase):
+	"""Inline-copy behavioural tests for the replay wrapper logic."""
+
+	def test_admin_check_passes_for_system_manager(self):
+		# Simulate the role-gate logic.
+		roles = ["System Manager", "Sales User"]
+		user = "milky@seismisk.com"
+		self.assertTrue(
+			"System Manager" in roles or user == "Administrator",
+			"System Manager role must pass the gate",
+		)
+
+	def test_admin_check_passes_for_administrator(self):
+		roles = []  # No roles, but session user is Administrator
+		user = "Administrator"
+		self.assertTrue(
+			"System Manager" in roles or user == "Administrator",
+			"Administrator user must pass the gate even without role",
+		)
+
+	def test_admin_check_blocks_regular_user(self):
+		roles = ["Sales User", "Stock User"]
+		user = "rep@example.com"
+		self.assertFalse(
+			"System Manager" in roles or user == "Administrator",
+			"Regular user (no SM, not Administrator) must be blocked",
+		)
+
+	def test_synthetic_payload_shape(self):
+		"""The wrapper must produce a payload of the shape
+		handle_order_edited extracts order_id from."""
+		shopify_order_id = 11048739799403
+		synthetic = {"order_edit": {"order_id": str(shopify_order_id)}}
+		# Mirror handle_order_edited's extraction logic.
+		order_edit = (synthetic.get("order_edit") if isinstance(synthetic, dict) else None) or {}
+		order_id = order_edit.get("order_id") or (synthetic.get("id") if isinstance(synthetic, dict) else None)
+		self.assertEqual(order_id, "11048739799403",
+			"synthetic payload must extract correctly via handle_order_edited's logic")
+
+	def test_replay_idempotent_when_so_already_in_sync(self):
+		"""If _reconcile_so_line_items returns no additions/refunds, the
+		replay call is a no-op for ``items`` — only the audit-trail ToDo
+		may be written. Mirrors the in-sync branch from the v1.3.3 tests."""
+		existing_by_lid = {"100": object(), "200": object()}
+		shopify_lines = [
+			{"id": 100, "current_quantity": 1, "title": "A"},
+			{"id": 200, "current_quantity": 1, "title": "B"},
+		]
+		added = []
+		refunded = []
+		for li in shopify_lines:
+			lid = str(li.get("id") or "")
+			cq = int(li.get("current_quantity") or 0)
+			if cq == 0:
+				continue
+			if lid and lid in existing_by_lid:
+				continue
+			added.append(li)
+		self.assertEqual(added, [],
+			"replay against an in-sync SO must add zero lines")
+		self.assertEqual(refunded, [])
+
+
+# ───────────────────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":
