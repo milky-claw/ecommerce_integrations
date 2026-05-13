@@ -871,7 +871,7 @@ def handle_order_edited(payload, request_id=None):
 			)
 			return
 
-		added, refunded = _reconcile_so_line_items(sales_order, full_order)
+		added, refunded, qty_updated = _reconcile_so_line_items(sales_order, full_order)
 
 		# Audit-trail ToDo (preserves legacy operator-visibility behaviour).
 		diff_lines = _build_order_edit_diff(sales_order, full_order)
@@ -881,7 +881,8 @@ def handle_order_edited(payload, request_id=None):
 				f"<b>Shopify Order Edited: {full_order.get('name', order_id)}</b><br><br>"
 				f"<b>Sales Order:</b> {sales_order.name}<br>"
 				f"<b>Customer:</b> {sales_order.customer}<br><br>"
-				f"<b>Reconciled:</b> +{len(added)} item(s), {len(refunded)} flagged refunded<br><br>"
+				f"<b>Reconciled:</b> +{len(added)} item(s), {len(refunded)} flagged refunded, "
+				f"{len(qty_updated)} qty updated<br><br>"
 				f"<b>Changes detected:</b><br><pre>{diff_text}</pre>"
 			)
 			try:
@@ -923,7 +924,10 @@ def handle_order_edited(payload, request_id=None):
 	else:
 		create_shopify_log(
 			status="Success",
-			message=f"orders/edited reconciled: +{len(added)} items, {len(refunded)} refund-flagged",
+			message=(
+				f"orders/edited reconciled: +{len(added)} items, "
+				f"{len(refunded)} refund-flagged, {len(qty_updated)} qty-updated"
+			),
 		)
 
 
@@ -960,17 +964,21 @@ def replay_handle_order_edited(shopify_order_id, request_id=None):
 
 
 def _reconcile_so_line_items(sales_order, full_order):
-	"""yei-v1.3.3: reconcile ``sales_order.items`` against the current
+	"""yei-v1.3.5: reconcile ``sales_order.items`` against the current
 	Shopify lineItems.
 
-	Returns ``(added_skus, refunded_lids)``.
+	Returns ``(added_skus, refunded_lids, qty_updated_lids)``.
 
 	* New Shopify lines (not on SO by ``shopify_line_item_id``) → append a
 	  new SOI built from the Shopify line via ``_build_soi_from_shopify_line``.
 	* Lines with ``current_quantity == 0`` that are on the SO → flag via
 	  ``flag_so_item_refunded`` (idempotent; respects existing flag).
-	* Idempotent: re-runs are no-ops since both branches are guarded by
-	  membership / flag checks.
+	* Lines already on the SO whose Shopify ``current_quantity`` differs
+	  from ``soi.qty`` → update ``soi.qty`` to match Shopify. Covers
+	  free-gift cart-promo bumps (1→2, 2→4) and partial refunds where
+	  current_quantity stays > 0 (yei-v1.3.5 §3.1 fix).
+	* Idempotent: re-runs are no-ops since all three branches are guarded
+	  by membership / flag / equality checks.
 
 	Requires Property Setter ``Sales Order Item.allow_on_submit=1`` so the
 	``save()`` call on a submitted SO doesn't raise
@@ -991,6 +999,7 @@ def _reconcile_so_line_items(sales_order, full_order):
 
 	added = []
 	refunded = []
+	qty_updated = []
 	taxes_inclusive = cint(getattr(setting, "taxes_inclusive", 0))
 	now = nowdate()
 
@@ -1013,7 +1022,14 @@ def _reconcile_so_line_items(sales_order, full_order):
 			continue
 
 		if lid and lid in existing_by_lid:
-			continue  # Already on the SO.
+			soi = existing_by_lid[lid]
+			if cint(soi.get("qty")) != cq:
+				# Qty changed on Shopify side (free-gift bump, partial refund > 0,
+				# or operator-edited line). Mirror to SOI. Property Setter
+				# Sales Order Item.allow_on_submit=1 permits the post-submit write.
+				soi.qty = cq
+				qty_updated.append(lid)
+			continue
 
 		# New line — build an SOI row from the Shopify line.
 		new_row = _build_soi_from_shopify_line(li, setting, sales_order, taxes_inclusive)
@@ -1021,12 +1037,12 @@ def _reconcile_so_line_items(sales_order, full_order):
 			sales_order.append("items", new_row)
 			added.append(new_row.get("item_code"))
 
-	if added:
-		# Required to flush new child rows. Property Setter
+	if added or qty_updated:
+		# Required to flush new child rows / qty updates. Property Setter
 		# Sales Order Item.allow_on_submit=1 unblocks the submit-time write.
 		sales_order.save(ignore_permissions=True)
 
-	return added, refunded
+	return added, refunded, qty_updated
 
 
 def _build_soi_from_shopify_line(shopify_item, setting, sales_order, taxes_inclusive):

@@ -10,6 +10,56 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.5] — 2026-05-14
+
+**Qty-diff branch in `_reconcile_so_line_items` — closes 3 of 6 Baumera audit `quantity_mismatch` findings.** Companion to ygf-v0.5.3 (post-submit DN cascade hook). Trigger: 2026-05-13 Baumera audit surfaced 6 `quantity_mismatch` rows that broke down into four distinct bugs (see `stages/04c-data-sync/working/supplier-sheet-3-issues-2026-05-12/QUANTITY-MISMATCH-INVESTIGATION-2026-05-14.md`). The primary bug, addressed here, accounts for #2962, #4416, #4485.
+
+### Why
+
+`_reconcile_so_line_items` (yei-v1.3.3) handles the **add** (new lid not on SO → append) + **full refund** (cq==0 → flag) branches but **silently `continue`s** when a Shopify line is already on the SO via matching `shopify_line_item_id`. That means:
+
+- **Free-gift cart-promo bumps** (1→2, 2→4 on the same lid) — silently ignored. Symptom: #2962 AUTO 1→2, #4416 AUTO 2→4.
+- **Partial refunds where `current_quantity > 0`** (Shopify reduces qty from N to M, M>0) — silently ignored because the refund branch only fires on `current_quantity == 0`. Symptom: #4485 partial refund of 1 unit of 3.
+
+There's a symmetry break between SO-create (`get_order_items` reads `current_quantity` authoritatively) and SO-edit (`_reconcile_so_line_items` only handles add/remove, never qty changes on existing lines).
+
+### Code changes
+
+- [`shopify/order.py:_reconcile_so_line_items`](ecommerce_integrations/shopify/order.py) — Insert qty-diff branch on the existing-lid path. When `lid in existing_by_lid` AND `cint(soi.qty) != cq`, assign `soi.qty = cq` and record the lid in `qty_updated`. Return shape changes from `(added, refunded)` to `(added, refunded, qty_updated)`. Save guard at line 1024 now fires when `added` OR `qty_updated` is non-empty (previously only `added`). Property Setter `Sales Order Item.allow_on_submit=1` (installed by `add_so_item_allow_on_submit` patch in v1.3.3) permits the post-submit `qty` write — no new schema.
+- [`shopify/order.py:handle_order_edited`](ecommerce_integrations/shopify/order.py) — Adapt caller at line 874 to unpack the new three-tuple. ToDo description and EIL Success message now include the qty-updated count alongside added + refund-flagged counts. No semantic change for downstream callers — the ToDo body still renders; just one more counter.
+
+No changes needed at `replay_handle_order_edited` (line 959) — it delegates to `handle_order_edited` and doesn't see the return shape.
+
+### Tests
+
+9 new tests in `tests/test_connector_patches.py` (`TestV135QtyDiffBranch*` suites):
+
+- 6 source-invariants on `_reconcile_so_line_items` (qty_updated list initialised, qty-diff guard regex, soi.qty assignment present, qty_updated.append(lid) present, save fires on `added or qty_updated`, return shape is three-tuple, caller unpacks three-tuple).
+- 3 behavioural unit tests (inline-copy of the reconcile logic, matching the file's testing pattern):
+  1. Existing SOI lid=X qty=1 + Shopify cq=2 → SOI qty=2, qty_updated contains lid.
+  2. Existing SOI lid=X qty=3 + Shopify quantity=3 current_quantity=2 → SOI qty=2, refunded stays empty (partial, not full refund), qty_updated contains lid.
+  3. Existing SOI lid=X qty=2 + Shopify cq=2 → no-op (qty_updated empty), idempotency check.
+
+Total: 150 tests in `test_connector_patches.py` (141 baseline + 9 new), 0 regressions. Existing test_supplier_sheet_3_issues.py (65 tests), test_b24_refunds.py (57 tests), test_freight_class.py (39 tests) all still pass.
+
+### Resolves
+
+3 of 6 Baumera 2026-05-13 audit `quantity_mismatch` findings:
+
+| # | Shopify # | Symptom | Resolved by v1.3.5 |
+|---|---|---|---|
+| 1 | #2962 | AUTO Shopify=2, SO/DN=1, same lid | YES — free-gift bump now propagates |
+| 4 | #4416 | AUTO Shopify=4, SO/DN=2, same lid | YES — same pattern (likely 2→4) |
+| 5 | #4485 | AUTO Shopify quantity=3 current=2, SO/DN=3 | YES — partial refund now propagates |
+
+The remaining 3 findings (#3532 missing AUTO line, #4131 + #4744 DN-cascade gap) are addressed by ygf-v0.5.3 + backfill harness updates landing in companion changes.
+
+### Reversibility
+
+Fully reversible by reverting this commit + redeploying yei-v1.3.4 (candidate `8nvvdi4fdh`). The new branch is pure-additive: idempotent (qty_updated stays empty when `cint(soi.qty) == cq`) and gated behind the existing `lid in existing_by_lid` membership check. Rollback path is `git revert` + Press revert-candidate.
+
+---
+
 ## [yei-v1.3.4] — 2026-05-13
 
 **Phase-2.5 micro-release — admin replay wrapper for ``handle_order_edited``.** Companion to yei-v1.3.3 Phase-2 backfill. Trigger: Phase-2 backfill recovered 44 of 136 historical EIL Invalid rows; the remaining 88 ``replay_failed`` because ``handle_order_edited`` is a webhook handler (not @frappe.whitelist'd) and ``frappe.client.insert`` of child rows on submitted parents returned 417 EXPECTATION FAILED even with the v1.3.3 Property Setter.

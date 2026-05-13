@@ -1984,5 +1984,196 @@ class TestB18Currency(unittest.TestCase):
         self.assertIsNone(_resolve_currency_b18({"currency": 123}))
 
 
+# ── yei-v1.3.5 §3.1: qty-diff branch on existing-lid lines ────────────
+#
+# `_reconcile_so_line_items` previously `continue`d silently when a Shopify
+# line was already on the SO (same `shopify_line_item_id`). Free-gift bumps
+# (1→2, 2→4) and partial refunds where `current_quantity > 0` were ignored.
+#
+# v1.3.5 adds: if `lid in existing_by_lid` AND Shopify `current_quantity`
+# differs from existing SOI `qty`, update the SOI qty + record the lid in
+# `qty_updated`. Return shape becomes `(added, refunded, qty_updated)`.
+# Save block fires when `added` OR `qty_updated` is non-empty.
+#
+# Inline-copy reconcile logic — the real `_reconcile_so_line_items` pulls
+# in frappe.get_doc + ecommerce_item dependencies that aren't worth mocking
+# here. We're testing the algorithm, matching the pattern used elsewhere
+# in this file.
+
+
+def _reconcile_so_line_items_v135(sales_order_items, shopify_lines):
+    """Inline copy of v1.3.5 reconcile logic — qty-diff branch.
+
+    `sales_order_items` is a list of dicts (each representing an existing
+    SOI) with at least keys: ``shopify_line_item_id``, ``qty``,
+    ``shopify_refunded``. The function mutates them in place when a qty
+    update applies and returns ``(added, refunded, qty_updated)``.
+
+    `shopify_lines` is a list of dicts mimicking Shopify line_items: at
+    least ``id``, ``current_quantity`` (or ``quantity``), ``title``.
+
+    Skips tip lines, refund branch for cq==0, qty-diff for existing lids,
+    new-line branch for unknown lids (returns a stub item_code).
+    """
+    def cint(x):
+        try:
+            return int(x or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    existing_by_lid = {}
+    for soi in sales_order_items:
+        lid = (soi.get("shopify_line_item_id") or "")
+        if lid:
+            existing_by_lid[str(lid)] = soi
+
+    added = []
+    refunded = []
+    qty_updated = []
+
+    for li in shopify_lines:
+        lid = str(li.get("id") or "")
+        cq = cint(li.get("current_quantity", li.get("quantity", 1)))
+
+        title = str(li.get("title") or "").strip().lower()
+        if title == "tip":
+            continue
+
+        if cq == 0:
+            soi = existing_by_lid.get(lid)
+            if soi and not cint(soi.get("shopify_refunded") or 0):
+                soi["__refunded_flagged__"] = True
+                refunded.append(lid)
+            continue
+
+        if lid and lid in existing_by_lid:
+            soi = existing_by_lid[lid]
+            if cint(soi.get("qty")) != cq:
+                soi["qty"] = cq
+                qty_updated.append(lid)
+            continue
+
+        added.append(li.get("__item_code__") or f"SKU-{lid}")
+
+    return added, refunded, qty_updated
+
+
+class TestV135QtyDiffBranchSourceInvariant(unittest.TestCase):
+    """yei-v1.3.5: assert the qty-diff branch is present in order.py source."""
+
+    @classmethod
+    def setUpClass(cls):
+        order_py = os.path.join(SHOPIFY_DIR, "order.py")
+        with open(order_py, "r", encoding="utf-8") as f:
+            cls.source = f.read()
+
+    def test_qty_updated_list_initialised(self):
+        self.assertIn("qty_updated = []", self.source,
+            "_reconcile_so_line_items must initialise qty_updated list")
+
+    def test_qty_diff_branch_updates_soi_qty(self):
+        # The qty-diff branch must compare cint(soi.get('qty')) != cq and
+        # then assign soi.qty = cq inside the existing-lid branch.
+        self.assertRegex(self.source,
+            r"if\s+lid\s+and\s+lid\s+in\s+existing_by_lid\s*:\s*\n"
+            r"\s*soi\s*=\s*existing_by_lid\[lid\]\s*\n"
+            r"\s*if\s+cint\(soi\.get\(\"qty\"\)\)\s*!=\s*cq\s*:",
+            "qty-diff branch must guard on cint(soi.get('qty')) != cq")
+        self.assertIn("soi.qty = cq", self.source,
+            "qty-diff branch must assign soi.qty = cq")
+
+    def test_qty_updated_records_lid(self):
+        self.assertIn("qty_updated.append(lid)", self.source,
+            "qty-diff branch must record the updated lid in qty_updated")
+
+    def test_save_fires_on_qty_updated(self):
+        # The save block must fire when either added or qty_updated is
+        # non-empty (not just when added is non-empty).
+        self.assertRegex(self.source,
+            r"if\s+added\s+or\s+qty_updated\s*:\s*\n",
+            "save block must fire when added OR qty_updated is non-empty")
+
+    def test_return_shape_is_three_tuple(self):
+        self.assertIn("return added, refunded, qty_updated", self.source,
+            "_reconcile_so_line_items must return (added, refunded, qty_updated)")
+
+    def test_caller_unpacks_three_tuple(self):
+        # handle_order_edited unpacks `added, refunded, qty_updated`.
+        self.assertIn(
+            "added, refunded, qty_updated = _reconcile_so_line_items(",
+            self.source,
+            "handle_order_edited must unpack the new (added, refunded, qty_updated) tuple",
+        )
+
+
+class TestV135QtyDiffBranchBehaviour(unittest.TestCase):
+    """yei-v1.3.5 §3.1: behavioural tests for the qty-diff branch."""
+
+    def test_existing_lid_qty_bump_updates_soi(self):
+        """Existing SOI lid=X qty=1 + Shopify cq=2 → SOI qty=2,
+        qty_updated contains the lid."""
+        soi = {"shopify_line_item_id": "100", "qty": 1, "shopify_refunded": 0}
+        sales_order_items = [soi]
+        shopify_lines = [{"id": 100, "current_quantity": 2, "title": "Greenhouse"}]
+
+        added, refunded, qty_updated = _reconcile_so_line_items_v135(
+            sales_order_items, shopify_lines,
+        )
+
+        self.assertEqual(soi["qty"], 2,
+            "SOI qty must update from 1 to 2 to match Shopify current_quantity")
+        self.assertEqual(qty_updated, ["100"],
+            "qty_updated must contain the bumped lid")
+        self.assertEqual(added, [],
+            "no new line added — same lid as existing SOI")
+        self.assertEqual(refunded, [],
+            "not a refund — cq is non-zero")
+
+    def test_partial_refund_qty_reduction_updates_soi(self):
+        """Existing SOI lid=X qty=3 + Shopify quantity=3 current_quantity=2
+        → SOI qty=2, refunded stays 0, qty_updated contains the lid.
+
+        Mirrors #4485 case (partial refund of 1 of 3 units). The line is
+        NOT fully refunded — current_quantity > 0 — so the refund branch
+        doesn't fire; the qty-diff branch handles it instead."""
+        soi = {"shopify_line_item_id": "200", "qty": 3, "shopify_refunded": 0}
+        sales_order_items = [soi]
+        shopify_lines = [{
+            "id": 200, "quantity": 3, "current_quantity": 2,
+            "title": "Greenhouse",
+        }]
+
+        added, refunded, qty_updated = _reconcile_so_line_items_v135(
+            sales_order_items, shopify_lines,
+        )
+
+        self.assertEqual(soi["qty"], 2,
+            "SOI qty must reduce from 3 to 2 (partial refund of 1 unit)")
+        self.assertEqual(refunded, [],
+            "refunded must stay empty — line isn't fully refunded (cq > 0)")
+        self.assertEqual(qty_updated, ["200"],
+            "qty_updated must contain the partially-refunded lid")
+        self.assertEqual(soi.get("shopify_refunded"), 0,
+            "shopify_refunded flag must stay 0 — partial, not full, refund")
+
+    def test_existing_lid_qty_match_is_noop(self):
+        """Existing SOI lid=X qty=2 + Shopify cq=2 → no-op (qty_updated empty).
+        Idempotency check — re-running reconcile must not double-write."""
+        soi = {"shopify_line_item_id": "300", "qty": 2, "shopify_refunded": 0}
+        sales_order_items = [soi]
+        shopify_lines = [{"id": 300, "current_quantity": 2, "title": "Greenhouse"}]
+
+        added, refunded, qty_updated = _reconcile_so_line_items_v135(
+            sales_order_items, shopify_lines,
+        )
+
+        self.assertEqual(soi["qty"], 2,
+            "SOI qty must stay at 2 — no-op when qty already matches")
+        self.assertEqual(qty_updated, [],
+            "qty_updated must be empty — Shopify cq matches SOI qty")
+        self.assertEqual(added, [])
+        self.assertEqual(refunded, [])
+
+
 if __name__ == "__main__":
     unittest.main()
