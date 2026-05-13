@@ -853,6 +853,19 @@ class TestV134ReplayHandleOrderEditedSourceInvariant(unittest.TestCase):
 		self.assertIn("handle_order_edited(", body,
 			"replay must delegate to handle_order_edited — no duplicated logic")
 
+	def test_replay_passes_request_id_as_is(self):
+		"""``request_id`` must be passed through unchanged — including
+		``None``. The handler's downstream ``create_shopify_log`` uses
+		``frappe.flags.request_id`` to decide between updating an existing
+		EIL row (when set) or creating a new one (when None). Forging a
+		fake request_id string would break the existing-EIL lookup with
+		``DoesNotExistError``."""
+		body = _source_of("replay_handle_order_edited", self.source)
+		self.assertIn("request_id=request_id", body,
+			"replay must pass request_id through to handle_order_edited "
+			"unchanged — not auto-fill with a fake value, which would "
+			"break the EIL row lookup downstream")
+
 
 class TestV134ReplayBehavioural(unittest.TestCase):
 	"""Inline-copy behavioural tests for the replay wrapper logic."""

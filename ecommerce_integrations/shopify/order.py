@@ -938,11 +938,18 @@ def replay_handle_order_edited(shopify_order_id, request_id=None):
 
 	Bypasses the HMAC validation that ``_validate_request`` does for live
 	webhooks; the admin-role gate is the explicit trust boundary.
+
+	``request_id`` is intentionally passed through as-is (default ``None``).
+	When ``None``, ``create_shopify_log`` creates a fresh ``Ecommerce
+	Integration Log`` row for the replay (consistent with live webhook
+	fires). If a caller passes an existing EIL name, that log gets updated
+	in place — useful when replaying a known-Invalid row to flip it to
+	Success.
 	"""
 	if "System Manager" not in frappe.get_roles() and frappe.session.user != "Administrator":
 		frappe.throw(_("System Manager role required for replay_handle_order_edited"))
 	synthetic = {"order_edit": {"order_id": str(shopify_order_id)}}
-	return handle_order_edited(synthetic, request_id=request_id or f"backfill-{frappe.utils.now()}")
+	return handle_order_edited(synthetic, request_id=request_id)
 
 
 def _reconcile_so_line_items(sales_order, full_order):
