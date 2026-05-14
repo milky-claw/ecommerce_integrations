@@ -10,6 +10,39 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.10] — 2026-05-14
+
+**`prepare_delivery_note` mirrors `Sales Order.shopify_fulfillment_status`.** Closes the architectural gap where Shopify's `orders/fulfilled` + `orders/partially_fulfilled` webhooks created a DN but never updated the SO-side mirror field, causing ~240+ SOs to drift in any 30-day window.
+
+### Why
+
+`Sales Order.shopify_fulfillment_status` (the `ORDER_FULFILLMENT_STATUS_FIELD` Custom Field) had exactly two writers before this patch:
+- `order.sync_sales_order` at line 173 (set at SO insert from Shopify's initial value).
+- `order.handle_order_edited` at line 949 (refreshed on `orders/edited`).
+
+`fulfillment.prepare_delivery_note` — the handler for `orders/fulfilled` and `orders/partially_fulfilled` — created a DN and stamped DN-level Shopify fields, but never wrote back the SO-level mirror. Population estimate: 29 of 30 most-recently-fulfilled Shopify orders had stale ERPNext mirror at investigation time on 2026-05-14. Downstream consumers (notably `ygh_fedex.supplier_sync.writer` per ygf-v0.5.7) rely on the mirror for scope gating + status-label stamping; without this patch they operate on stale data.
+
+### What changes
+
+Inside `prepare_delivery_note`, after `create_delivery_note(...)` returns successfully and before `create_shopify_log(status="Success")`, write the mirror via `frappe.db.set_value(..., update_modified=False)`. Same pattern as `handle_order_edited` at order.py:944. `update_modified=False` skips the `allow_on_submit=0` check on the Custom Field and avoids bumping `modified`.
+
+### Dependencies
+
+- Paired with ygf-v0.5.7 (writer policy reversal) — ship together in a single Press deploy so the mirror-write activates simultaneously with the writer's new "keep fulfilled rows" behavior. No version-skew window.
+- Cohort A backfill (~500 SOs) follows the deploy to clean historical drift.
+
+### Risk
+
+- Race with `handle_order_edited` writing the same field simultaneously: harmless (last writer wins; values converge to Shopify's current state via either handler).
+- Idempotent on webhook redelivery: `db.set_value` overwrites unconditionally.
+- Restock/cancel path NOT addressed in this release (`orders/cancelled` handler doesn't update mirror). Defer; rare event.
+
+### Tests
+
+- Post-deploy: trigger one Shopify fulfillment on a test SO via `orders/fulfilled` webhook. Verify `Sales Order.shopify_fulfillment_status` flips to `"fulfilled"` (not via `handle_order_edited`). Verify EIL `prepare_delivery_note` Success count continues without exception.
+
+---
+
 ## [yei-v1.3.9] — 2026-05-14
 
 **Hotpatch: live `orders/edited` webhook handler now activates a Shopify session.** Add `@temp_shopify_session` to `handle_order_edited` so the worker's `Order.find(order_id)` REST call inside the handler succeeds. First live manifestation surfaced 2026-05-14 18:28:28Z by Shopify order #4978 (AfterSell Upsell added GNR-AIR-VENT-MANU after initial order creation; webhook errored at `Order.find`; SOI never created; supplier sheet missed the line).

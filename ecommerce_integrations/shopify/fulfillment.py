@@ -6,6 +6,7 @@ from frappe.utils import cint, cstr, getdate
 
 from ecommerce_integrations.shopify.constants import (
 	FULLFILLMENT_ID_FIELD,
+	ORDER_FULFILLMENT_STATUS_FIELD,
 	ORDER_ID_FIELD,
 	ORDER_NUMBER_FIELD,
 	SETTING_DOCTYPE,
@@ -25,6 +26,14 @@ def prepare_delivery_note(payload, request_id=None):
 		sales_order = get_sales_order(cstr(order["id"]))
 		if sales_order:
 			create_delivery_note(order, setting, sales_order)
+			# Mirror Shopify fulfillment_status back to SO.
+			frappe.db.set_value(
+				"Sales Order",
+				sales_order.name,
+				ORDER_FULFILLMENT_STATUS_FIELD,
+				order.get("fulfillment_status") or "",
+				update_modified=False,
+			)
 			create_shopify_log(status="Success")
 		else:
 			create_shopify_log(status="Invalid", message="Sales Order not found for syncing delivery note.")
