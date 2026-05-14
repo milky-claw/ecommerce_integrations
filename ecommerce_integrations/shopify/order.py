@@ -964,7 +964,7 @@ def replay_handle_order_edited(shopify_order_id, request_id=None):
 
 
 def _reconcile_so_line_items(sales_order, full_order):
-	"""yei-v1.3.5: reconcile ``sales_order.items`` against the current
+	"""yei-v1.3.6: reconcile ``sales_order.items`` against the current
 	Shopify lineItems.
 
 	Returns ``(added_skus, refunded_lids, qty_updated_lids)``.
@@ -980,10 +980,21 @@ def _reconcile_so_line_items(sales_order, full_order):
 	* Idempotent: re-runs are no-ops since all three branches are guarded
 	  by membership / flag / equality checks.
 
-	Requires Property Setter ``Sales Order Item.allow_on_submit=1`` so the
-	``save()`` call on a submitted SO doesn't raise
-	``UpdateAfterSubmitError`` for the new child rows. Installed by patch
-	``add_so_item_allow_on_submit`` (yei-v1.3.3).
+	yei-v1.3.6 fixes two regressions in v1.3.5's save path:
+
+	* **Class A** — before ``sales_order.save()``, calls
+	  ``set_missing_values()`` + ``calculate_taxes_and_totals()`` so that
+	  newly-appended SOI rows have ``base_net_amount`` (and friends)
+	  populated. Without this, ``calculate_commission`` (fired by
+	  ``on_update_after_submit``) crashes on ``sum([None, 0.0, ...])``.
+	* **Class B** — qty-diff branch sets
+	  ``flags.ignore_validate_update_after_submit = True`` on both the
+	  child SOI and the parent SO before save, mirroring the blessed
+	  pattern ERPNext's own ``update_child_qty_rate`` uses
+	  (accounts_controller.py:4158, 4167). The table-level Property
+	  Setter ``Sales Order Item.items.allow_on_submit=1`` (installed by
+	  patch ``add_so_item_allow_on_submit`` in v1.3.3) only gates
+	  add/delete; per-field ``qty`` edits need the flag.
 	"""
 	from ecommerce_integrations.shopify.refund import flag_so_item_refunded
 
@@ -1025,8 +1036,23 @@ def _reconcile_so_line_items(sales_order, full_order):
 			soi = existing_by_lid[lid]
 			if cint(soi.get("qty")) != cq:
 				# Qty changed on Shopify side (free-gift bump, partial refund > 0,
-				# or operator-edited line). Mirror to SOI. Property Setter
-				# Sales Order Item.allow_on_submit=1 permits the post-submit write.
+				# or operator-edited line). Mirror to SOI.
+				#
+				# yei-v1.3.6 Class B fix: the table-level Property Setter
+				# (Sales Order Item.items.allow_on_submit=1) gates add/delete
+				# of child rows on submit, but NOT per-field edits on existing
+				# rows. Per-field changes still hit
+				# base_document._validate_update_after_submit which crashes
+				# with UpdateAfterSubmitError ("Not allowed to change Quantity
+				# after submission from M to K") because the field-level
+				# `qty.allow_on_submit` on Sales Order Item is 0.
+				#
+				# The blessed pattern (used by ERPNext's own
+				# update_child_qty_rate at accounts_controller.py:4158, 4167)
+				# is to set `flags.ignore_validate_update_after_submit = True`
+				# on both child and parent before save — this short-circuits
+				# the validation while preserving the in-memory mutation.
+				soi.flags.ignore_validate_update_after_submit = True
 				soi.qty = cq
 				qty_updated.append(lid)
 			continue
@@ -1038,8 +1064,31 @@ def _reconcile_so_line_items(sales_order, full_order):
 			added.append(new_row.get("item_code"))
 
 	if added or qty_updated:
+		# yei-v1.3.6 Class A fix: before save(), populate per-item calculated
+		# fields (amount, net_amount, base_amount, base_net_amount, base_rate,
+		# etc.) via the blessed ERPNext path. Without this, newly-appended
+		# SOI rows have base_net_amount=None and selling_controller's
+		# calculate_commission crashes with:
+		#   TypeError: unsupported operand type(s) for +: 'float' and 'NoneType'
+		# at sum(item.base_net_amount for item in self.items if item.grant_commission)
+		# (selling_controller.py:222) when on_update_after_submit fires.
+		#
+		# set_missing_values() is mostly a no-op for already-complete submitted
+		# SOs but is cheap+idempotent (fills price_list_rate etc. if missing).
+		# calculate_taxes_and_totals() is load-bearing — runs calculate_item_values
+		# which populates amount/net_amount/base_* on every item.
+		sales_order.set_missing_values()
+		sales_order.calculate_taxes_and_totals()
+
+		if qty_updated:
+			# Parent-level flag — short-circuits validate_update_after_submit
+			# for the per-field qty edit on the existing SOI rows.
+			# See document.py:1098-1101 + accounts_controller.py:4167.
+			sales_order.flags.ignore_validate_update_after_submit = True
+
 		# Required to flush new child rows / qty updates. Property Setter
-		# Sales Order Item.allow_on_submit=1 unblocks the submit-time write.
+		# Sales Order Item.items.allow_on_submit=1 unblocks the submit-time
+		# write for new rows; the flag above unblocks per-field qty updates.
 		sales_order.save(ignore_permissions=True)
 
 	return added, refunded, qty_updated

@@ -10,6 +10,61 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.6] — 2026-05-14
+
+**Hotpatch for two v1.3.5 regressions surfaced by autopilot Phase 4 replay sweep (2026-05-14T01:50Z).** Phase 4 replayed 51 stuck SOs through `replay_handle_order_edited`; 28 failed Class A (`TypeError` in `calculate_commission`), 9 failed Class B (`UpdateAfterSubmitError` on per-field qty edit), 14 returned "Success +0 items" (false-negative matches — no work). Every Class A/B failure rolled back the transaction; bench state unchanged from Phase 0 snapshot.
+
+### Why
+
+v1.3.5's save block in `_reconcile_so_line_items` had two latent bugs that only surface when (a) a new SOI is appended OR (b) an existing SOI's qty mutates — both of which v1.3.5 explicitly added to support the Baumera 2026-05-13 audit findings. Phase 0/1/2 of autopilot tested individual call paths but not the wide replay sweep that exercised every code path against historical SOs.
+
+**Class A — `TypeError: unsupported operand type(s) for +: 'float' and 'NoneType'`.** Root: `_build_soi_from_shopify_line` returns a dict with `rate`, `qty`, `price_list_rate`, `uom`, etc. but NOT the per-item calculated fields (`amount`, `net_amount`, `base_amount`, `base_net_amount`). `_reconcile_so_line_items` appends that dict via `sales_order.append("items", new_row)` and immediately calls `sales_order.save(ignore_permissions=True)`. The save triggers `on_update_after_submit` → `calculate_commission` (selling_controller.py:207-228), whose line 222 does `sum(item.base_net_amount for item in self.items if item.grant_commission)`. With `base_net_amount=None` on the new row, `sum([None, 0.0, ...])` raises TypeError.
+
+**Class B — `Row #N: Not allowed to change Quantity after submission from M to K`.** Root: v1.3.5's qty-diff branch (order.py:1024-1032) directly mutates `soi.qty` on an existing existing-LID SOI. The yei-v1.3.3 Property Setter `Sales Order Item.items.allow_on_submit=1` is **table-level** (lets the parent's `items` table accept add/delete rows on submit) but NOT per-field. ERPNext's `base_document._validate_update_after_submit` (base_document.py:1259-1294) iterates each field and raises `UpdateAfterSubmitError` if `df.allow_on_submit` is false and the value changed. The field-level `qty.allow_on_submit` on Sales Order Item is 0.
+
+### Code changes
+
+- [`shopify/order.py:_reconcile_so_line_items`](ecommerce_integrations/shopify/order.py) — Two fixes:
+  - **Class A** — before `sales_order.save()`, insert `sales_order.set_missing_values()` + `sales_order.calculate_taxes_and_totals()`. The blessed ERPNext path: `calculate_taxes_and_totals` (accounts_controller.py:736-748) calls the module-level class (taxes_and_totals.py:32) which runs `_calculate()` → `calculate_item_values()` (taxes_and_totals.py:167-243) → per-item `amount`/`net_amount` are computed, then `_set_in_company_currency(item, [...])` (taxes_and_totals.py:245-251) populates `base_amount`, `base_net_amount`, `base_rate`, etc. on every item including the newly-appended row. `set_missing_values()` (selling_controller.py:109-115) is mostly a no-op for already-complete submitted SOs but is cheap+idempotent (defence-in-depth for any price-list-derived defaults on new rows).
+  - **Class B** — qty-diff branch sets `soi.flags.ignore_validate_update_after_submit = True` BEFORE `soi.qty = cq`. The save block sets the same flag on the parent SO when `qty_updated` is non-empty. This is the exact same escape hatch ERPNext's own `update_child_qty_rate` uses internally — see `accounts_controller.py:4158` (child flag) and `accounts_controller.py:4167` (parent flag). The parent flag short-circuits `validate_update_after_submit` (document.py:1098-1101) before it can iterate children and hit the per-field check.
+
+### Why not `update_child_qty_rate`
+
+We considered wrapping ERPNext's whitelisted `update_child_qty_rate(parent_doctype, trans_items, parent_doctype_name)` (accounts_controller.py:3848) for Class B. Two reasons against:
+
+1. **Full-replace contract**: `validate_and_delete_children` (accounts_controller.py:3823-3845, called on line 4004) iterates `parent.items` and DELETES any item whose `name` is not in `trans_items`. We'd need to enumerate every existing SOI (changed + unchanged) — a refactor that bloats the reconcile contract.
+2. **Side-effect blast radius**: post-mutation, the function runs `make_packing_list`, `set_gross_profit`, `validate_selling_price`, `validate_warehouse`, `update_reserved_qty`, `update_project`, `update_delivery_status`, `update_blanket_order`, `update_billing_percentage`, `set_status`, `check_credit_limit`, `validate_approving_authority`, and stock-reservation cancel+recreate (accounts_controller.py:4166-4255). Any of those may throw in webhook context against a historical SO with stale customer balance / reservation state. Trading 28+9 known failures for an unbounded set of fresh side-effect failures is a bad deal.
+
+The flag itself IS the blessed primitive; `update_child_qty_rate` is just a heavy wrapper around it. We use the primitive directly.
+
+### Tests
+
+12 new tests in `tests/test_connector_patches.py` (`TestV136Hotpatch*` suites):
+
+- 7 source-invariants (Class A: `set_missing_values()` called, `calculate_taxes_and_totals()` called before save, set_missing_values precedes calculate_taxes; Class B: child flag set before qty mutation, parent flag set when qty_updated, parent flag precedes save; version bumped to 1.3.6).
+- 5 behavioural unit tests via inline `_reconcile_so_line_items_v136` helper (qty bump sets child flag, qty bump sets parent flag, qty no-op sets no flags, add-only doesn't set parent qty-flag (idempotency check on the flag setter being gated on qty_updated, not added), partial refund still sets both flags).
+
+Total: 162 tests (150 baseline + 12 new), 0 regressions. v1.3.5 source-invariant tests (6) still pass — Class A and B additions are pure-insertion (don't change the existing assignments matched by v135 regexes).
+
+### Reversibility
+
+Fully reversible by reverting this commit + redeploying yei-v1.3.5. Both fixes are pure-additive at runtime:
+- Class A adds two method calls before save; both are idempotent on a submitted SO with complete data.
+- Class B adds two flag sets; flags are ephemeral (in-memory only, cleared between request cycles).
+
+Rollback path: `git revert <commit>` + Press revert-candidate.
+
+### Refs
+
+- Phase 4 EXECUTION-PAUSE-2026-05-14T01-50Z.md (yel/RX root-cause exhibit)
+- accounts_controller.py:3849 (update_child_qty_rate signature + side-effect chain)
+- accounts_controller.py:4158, 4167 (the blessed flag pattern this patch mirrors)
+- selling_controller.py:222 (the `sum(item.base_net_amount ...)` crash site)
+- base_document.py:1259-1294 (per-field allow_on_submit validation)
+- taxes_and_totals.py:167-243 + 245-251 (the base_net_amount population path)
+
+---
+
 ## [yei-v1.3.5] — 2026-05-14
 
 **Qty-diff branch in `_reconcile_so_line_items` — closes 3 of 6 Baumera audit `quantity_mismatch` findings.** Companion to ygf-v0.5.3 (post-submit DN cascade hook). Trigger: 2026-05-13 Baumera audit surfaced 6 `quantity_mismatch` rows that broke down into four distinct bugs (see `stages/04c-data-sync/working/supplier-sheet-3-issues-2026-05-12/QUANTITY-MISMATCH-INVESTIGATION-2026-05-14.md`). The primary bug, addressed here, accounts for #2962, #4416, #4485.

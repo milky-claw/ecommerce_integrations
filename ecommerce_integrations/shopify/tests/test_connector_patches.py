@@ -2175,5 +2175,265 @@ class TestV135QtyDiffBranchBehaviour(unittest.TestCase):
         self.assertEqual(refunded, [])
 
 
+class TestV136HotpatchSourceInvariant(unittest.TestCase):
+    """yei-v1.3.6 hotpatch: assert both Class A and Class B fixes are
+    present in order.py source.
+
+    Class A — before save() in _reconcile_so_line_items, the parent SO
+    must have set_missing_values() + calculate_taxes_and_totals() called
+    so that newly-appended SOI rows have base_net_amount populated
+    before on_update_after_submit's calculate_commission runs.
+
+    Class B — qty-diff branch must set
+    flags.ignore_validate_update_after_submit = True on the child SOI
+    before assigning soi.qty = cq; the save block must set the same
+    flag on the parent SO when qty_updated is non-empty.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        order_py = os.path.join(SHOPIFY_DIR, "order.py")
+        with open(order_py, "r", encoding="utf-8") as f:
+            cls.source = f.read()
+
+    def test_class_a_set_missing_values_called_before_save(self):
+        # The save block (if added or qty_updated:) must call
+        # set_missing_values() before save().
+        self.assertRegex(self.source,
+            r"if\s+added\s+or\s+qty_updated\s*:\s*\n"
+            r"(?:.*\n)*?"
+            r"\s*sales_order\.set_missing_values\(\)",
+            "set_missing_values() must be called in the save block")
+
+    def test_class_a_calculate_taxes_and_totals_called_before_save(self):
+        # calculate_taxes_and_totals() must be called before save() so
+        # newly-appended SOI rows have base_net_amount populated before
+        # on_update_after_submit's calculate_commission runs.
+        self.assertRegex(self.source,
+            r"sales_order\.calculate_taxes_and_totals\(\)\s*\n"
+            r"(?:.*\n)*?"
+            r"\s*sales_order\.save\(ignore_permissions=True\)",
+            "calculate_taxes_and_totals() must run before sales_order.save()")
+
+    def test_class_a_set_missing_values_precedes_calculate_taxes(self):
+        # set_missing_values() should be called before
+        # calculate_taxes_and_totals() (selling-controller order matches
+        # ERPNext's blessed sequence).
+        self.assertRegex(self.source,
+            r"sales_order\.set_missing_values\(\)\s*\n"
+            r"\s*sales_order\.calculate_taxes_and_totals\(\)",
+            "set_missing_values() must precede calculate_taxes_and_totals()")
+
+    def test_class_b_child_flag_set_before_qty_mutation(self):
+        # The qty-diff branch must set the child SOI's
+        # ignore_validate_update_after_submit flag BEFORE the soi.qty
+        # assignment.
+        self.assertRegex(self.source,
+            r"soi\.flags\.ignore_validate_update_after_submit\s*=\s*True\s*\n"
+            r"\s*soi\.qty\s*=\s*cq",
+            "child SOI's ignore_validate_update_after_submit flag must be "
+            "set before soi.qty = cq")
+
+    def test_class_b_parent_flag_set_when_qty_updated(self):
+        # When qty_updated is non-empty, the parent SO's
+        # ignore_validate_update_after_submit flag must be set before
+        # save() — mirrors accounts_controller.py:4167.
+        self.assertRegex(self.source,
+            r"if\s+qty_updated\s*:\s*\n"
+            r"\s*(?:#.*\n\s*)*"
+            r"sales_order\.flags\.ignore_validate_update_after_submit\s*=\s*True",
+            "parent SO's ignore_validate_update_after_submit flag must be "
+            "set when qty_updated is non-empty")
+
+    def test_class_b_parent_flag_set_before_save(self):
+        # Parent flag must be set before save().
+        self.assertRegex(self.source,
+            r"sales_order\.flags\.ignore_validate_update_after_submit\s*=\s*True\s*\n"
+            r"(?:.*\n)*?"
+            r"\s*sales_order\.save\(ignore_permissions=True\)",
+            "parent flag must precede save()")
+
+    def test_version_bumped_to_136(self):
+        init_py = os.path.join(
+            os.path.dirname(SHOPIFY_DIR), "__init__.py"
+        )
+        with open(init_py, "r", encoding="utf-8") as f:
+            init_source = f.read()
+        self.assertIn('__version__ = "1.3.6"', init_source,
+            "package version must be bumped to 1.3.6")
+
+
+def _reconcile_so_line_items_v136(sales_order_items, shopify_lines,
+                                   parent_flags=None):
+    """Inline copy of v1.3.6 reconcile logic.
+
+    Extends v1.3.5's pure-logic helper with the v1.3.6 flag semantics:
+    when the qty-diff branch fires, the child SOI dict gets a
+    ``__child_flag_set__`` marker (stand-in for
+    ``soi.flags.ignore_validate_update_after_submit = True`` in real
+    Frappe doc semantics), and the parent receives
+    ``__parent_flag_set__`` (stand-in for the parent flag) iff
+    qty_updated ends up non-empty.
+
+    The Class A pre-save calls (set_missing_values +
+    calculate_taxes_and_totals) are not modelled here because they
+    have no pure-logic equivalent — they're Frappe API calls. The
+    source-invariant tests above pin those.
+
+    `sales_order_items` is a list of dicts.
+    `shopify_lines` is a list of dicts.
+    `parent_flags` is an optional dict to receive parent-level markers.
+    """
+    def cint(x):
+        try:
+            return int(x or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if parent_flags is None:
+        parent_flags = {}
+
+    existing_by_lid = {}
+    for soi in sales_order_items:
+        lid = (soi.get("shopify_line_item_id") or "")
+        if lid:
+            existing_by_lid[str(lid)] = soi
+
+    added = []
+    refunded = []
+    qty_updated = []
+
+    for li in shopify_lines:
+        lid = str(li.get("id") or "")
+        cq = cint(li.get("current_quantity", li.get("quantity", 1)))
+
+        title = str(li.get("title") or "").strip().lower()
+        if title == "tip":
+            continue
+
+        if cq == 0:
+            soi = existing_by_lid.get(lid)
+            if soi and not cint(soi.get("shopify_refunded") or 0):
+                soi["__refunded_flagged__"] = True
+                refunded.append(lid)
+            continue
+
+        if lid and lid in existing_by_lid:
+            soi = existing_by_lid[lid]
+            if cint(soi.get("qty")) != cq:
+                # v1.3.6 Class B: set child flag BEFORE qty mutation.
+                soi["__child_flag_set__"] = True
+                soi["qty"] = cq
+                qty_updated.append(lid)
+            continue
+
+        added.append(li.get("__item_code__") or f"SKU-{lid}")
+
+    # v1.3.6 Class B: parent flag set iff qty_updated is non-empty.
+    if added or qty_updated:
+        if qty_updated:
+            parent_flags["__parent_flag_set__"] = True
+
+    return added, refunded, qty_updated
+
+
+class TestV136HotpatchBehaviour(unittest.TestCase):
+    """yei-v1.3.6 hotpatch: behavioural tests for the Class B flag
+    semantics. Class A is pinned by source-invariant tests above."""
+
+    def test_qty_bump_sets_child_flag(self):
+        """Qty-diff branch must set the child SOI's
+        ignore_validate_update_after_submit flag BEFORE mutating qty."""
+        soi = {"shopify_line_item_id": "100", "qty": 1, "shopify_refunded": 0}
+        sales_order_items = [soi]
+        shopify_lines = [{"id": 100, "current_quantity": 2, "title": "Greenhouse"}]
+        parent_flags = {}
+
+        added, refunded, qty_updated = _reconcile_so_line_items_v136(
+            sales_order_items, shopify_lines, parent_flags=parent_flags,
+        )
+
+        self.assertEqual(soi["qty"], 2, "qty must update from 1 to 2")
+        self.assertTrue(soi.get("__child_flag_set__"),
+            "child SOI's ignore_validate_update_after_submit flag must "
+            "be set when qty mutates")
+        self.assertEqual(qty_updated, ["100"])
+
+    def test_qty_bump_sets_parent_flag(self):
+        """When qty_updated is non-empty, parent SO's
+        ignore_validate_update_after_submit flag must be set before save."""
+        soi = {"shopify_line_item_id": "100", "qty": 1, "shopify_refunded": 0}
+        sales_order_items = [soi]
+        shopify_lines = [{"id": 100, "current_quantity": 2, "title": "Greenhouse"}]
+        parent_flags = {}
+
+        _reconcile_so_line_items_v136(
+            sales_order_items, shopify_lines, parent_flags=parent_flags,
+        )
+
+        self.assertTrue(parent_flags.get("__parent_flag_set__"),
+            "parent SO's ignore_validate_update_after_submit flag must "
+            "be set when qty_updated is non-empty")
+
+    def test_qty_noop_does_not_set_flags(self):
+        """When qty matches, no flag should be set. Idempotency check."""
+        soi = {"shopify_line_item_id": "300", "qty": 2, "shopify_refunded": 0}
+        sales_order_items = [soi]
+        shopify_lines = [{"id": 300, "current_quantity": 2, "title": "Greenhouse"}]
+        parent_flags = {}
+
+        added, refunded, qty_updated = _reconcile_so_line_items_v136(
+            sales_order_items, shopify_lines, parent_flags=parent_flags,
+        )
+
+        self.assertEqual(qty_updated, [],
+            "qty_updated must be empty — qty matched")
+        self.assertNotIn("__child_flag_set__", soi,
+            "child flag must not be set when qty matches (no mutation)")
+        self.assertNotIn("__parent_flag_set__", parent_flags,
+            "parent flag must not be set when qty_updated is empty")
+
+    def test_add_only_does_not_set_parent_qty_flag(self):
+        """When only added rows (no qty updates), parent flag should
+        NOT be set — the flag is qty-diff-specific. Add-only is
+        unblocked by the table-level Property Setter alone."""
+        sales_order_items = []
+        shopify_lines = [{
+            "id": 999, "current_quantity": 1, "title": "New Item",
+            "__item_code__": "SKU-999",
+        }]
+        parent_flags = {}
+
+        added, refunded, qty_updated = _reconcile_so_line_items_v136(
+            sales_order_items, shopify_lines, parent_flags=parent_flags,
+        )
+
+        self.assertEqual(added, ["SKU-999"])
+        self.assertEqual(qty_updated, [])
+        self.assertNotIn("__parent_flag_set__", parent_flags,
+            "parent flag must not be set when only add rows — the table-"
+            "level Property Setter alone unblocks new-row inserts")
+
+    def test_partial_refund_qty_change_sets_flags(self):
+        """Mirrors #4485-style partial refund: qty drops but cq > 0.
+        Both the child and parent flags must be set."""
+        soi = {"shopify_line_item_id": "200", "qty": 3, "shopify_refunded": 0}
+        sales_order_items = [soi]
+        shopify_lines = [{
+            "id": 200, "quantity": 3, "current_quantity": 2,
+            "title": "Greenhouse",
+        }]
+        parent_flags = {}
+
+        added, refunded, qty_updated = _reconcile_so_line_items_v136(
+            sales_order_items, shopify_lines, parent_flags=parent_flags,
+        )
+
+        self.assertEqual(soi["qty"], 2)
+        self.assertTrue(soi.get("__child_flag_set__"))
+        self.assertTrue(parent_flags.get("__parent_flag_set__"))
+        self.assertEqual(qty_updated, ["200"])
+
+
 if __name__ == "__main__":
     unittest.main()
