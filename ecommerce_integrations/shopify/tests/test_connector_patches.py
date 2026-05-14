@@ -2257,14 +2257,8 @@ class TestV136HotpatchSourceInvariant(unittest.TestCase):
             r"\s*sales_order\.save\(ignore_permissions=True\)",
             "parent flag must precede save()")
 
-    def test_version_bumped_to_137(self):
-        init_py = os.path.join(
-            os.path.dirname(SHOPIFY_DIR), "__init__.py"
-        )
-        with open(init_py, "r", encoding="utf-8") as f:
-            init_source = f.read()
-        self.assertIn('__version__ = "1.3.7"', init_source,
-            "package version must be bumped to 1.3.7")
+    # Version pin moved to TestV138GetSalesOrderDisambiguationSourceInvariant
+    # to track the latest released version.
 
 
 def _reconcile_so_line_items_v136(sales_order_items, shopify_lines,
@@ -2550,6 +2544,95 @@ class TestV137HotpatchBehaviour(unittest.TestCase):
             "be set on the add-only path (v1.3.7 fix). Without it, "
             "appending a new SOI to a submitted SO raises "
             "UpdateAfterSubmitError on the parent total_qty mutation")
+
+
+# ---------------------------------------------------------------------------
+# yei-v1.3.8 — get_sales_order disambiguation for non-unique shopify_order_id
+# ---------------------------------------------------------------------------
+
+class TestV138GetSalesOrderDisambiguationSourceInvariant(unittest.TestCase):
+    """v1.3.8 fixes get_sales_order non-determinism when multiple SOs share
+    the same shopify_order_id (Custom Field has unique=0 on this site).
+    Cancelled-then-amended orders produce two rows: original docstatus=2,
+    amendment docstatus=1. Pre-v1.3.8, ``frappe.db.get_value`` returned
+    the first match in default order — could be either; ``cancel_order``
+    then silently no-op'd when it picked the cancelled original
+    (root cause of #3442 / SAL-ORD-2026-01169-1 drift on 2026-05-14).
+
+    Source-invariants pin the v1.3.8 fix: ``get_sales_order`` must use
+    ``frappe.get_all`` (returning all matches), then sort by docstatus
+    priority before fetching the doc.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        order_py = os.path.join(SHOPIFY_DIR, "order.py")
+        with open(order_py, "r", encoding="utf-8") as f:
+            cls.source = f.read()
+
+    def test_version_bumped_to_138(self):
+        init_py = os.path.join(
+            os.path.dirname(SHOPIFY_DIR), "__init__.py"
+        )
+        with open(init_py, "r", encoding="utf-8") as f:
+            init_source = f.read()
+        self.assertIn('__version__ = "1.3.8"', init_source,
+            "package version must be bumped to 1.3.8")
+
+    def test_get_sales_order_no_longer_uses_db_get_value(self):
+        """Regression guard: the v1.3.7 bug was
+            sales_order = frappe.db.get_value("Sales Order", filters={ORDER_ID_FIELD: order_id})
+        which returns the first match non-deterministically. The
+        v1.3.8 fix must NOT use this single-row primitive inside
+        get_sales_order."""
+        # Find the body of get_sales_order
+        m = re.search(
+            r"def get_sales_order\(order_id\):(.+?)\n(?:def |class )",
+            self.source, re.DOTALL,
+        )
+        self.assertIsNotNone(m, "get_sales_order must be defined")
+        body = m.group(1)
+        self.assertNotRegex(body,
+            r"frappe\.db\.get_value\s*\(\s*[\"']Sales Order[\"']",
+            "v1.3.7 single-row lookup must be removed — duplicates make it "
+            "non-deterministic")
+
+    def test_get_sales_order_uses_get_all_with_docstatus(self):
+        """The v1.3.8 form fetches multiple rows with docstatus field."""
+        m = re.search(
+            r"def get_sales_order\(order_id\):(.+?)\n(?:def |class )",
+            self.source, re.DOTALL,
+        )
+        body = m.group(1)
+        self.assertRegex(body,
+            r"frappe\.get_all\(\s*[\"']Sales Order[\"']",
+            "must use frappe.get_all to enumerate all candidate SOs")
+        self.assertRegex(body, r"[\"']docstatus[\"']",
+            "must request docstatus field in get_all to disambiguate")
+
+    def test_get_sales_order_sorts_by_docstatus_priority(self):
+        """Priority dict must map 1→0, 0→1, 2→2 (alive > draft > cancelled)."""
+        m = re.search(
+            r"def get_sales_order\(order_id\):(.+?)\n(?:def |class )",
+            self.source, re.DOTALL,
+        )
+        body = m.group(1)
+        self.assertRegex(body, r"\.sort\s*\(",
+            "must sort the candidate SOs before picking one")
+        # The priority dict — order matters semantically: 1 first (alive),
+        # then 0 (draft), then 2 (cancelled).
+        self.assertRegex(body, r"\{\s*1\s*:\s*0\s*,\s*0\s*:\s*1\s*,\s*2\s*:\s*2",
+            "priority must be {1: 0, 0: 1, 2: 2} — alive > draft > cancelled")
+
+    def test_get_sales_order_returns_none_when_empty(self):
+        """Behavior preserved: no matches → None (not raise)."""
+        m = re.search(
+            r"def get_sales_order\(order_id\):(.+?)\n(?:def |class )",
+            self.source, re.DOTALL,
+        )
+        body = m.group(1)
+        self.assertRegex(body, r"if\s+not\s+rows\s*:\s*\n\s*return\s+None",
+            "must return None when no SO matches the shopify_order_id")
 
 
 if __name__ == "__main__":

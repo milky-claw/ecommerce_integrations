@@ -724,10 +724,27 @@ def update_taxes_with_shipping_lines(taxes, shipping_lines, setting, items, taxe
 
 
 def get_sales_order(order_id):
-	"""Get ERPNext sales order using shopify order id."""
-	sales_order = frappe.db.get_value("Sales Order", filters={ORDER_ID_FIELD: order_id})
-	if sales_order:
-		return frappe.get_doc("Sales Order", sales_order)
+	"""Get ERPNext sales order using shopify order id.
+
+	yei-v1.3.8 — Custom Field ``shopify_order_id`` on this site has
+	``unique=0``, so ERPNext amendments produce multiple SOs sharing the
+	same Shopify ID (cancel original → docstatus=2; amendment ``-1`` with
+	docstatus=1). Prefer the live row so cancel/refund/edit webhooks
+	operate on the active document, not a stale cancelled original.
+	Without this, ``cancel_order`` silently no-ops when ``frappe.db
+	.get_value`` returns the already-cancelled docstatus=2 sibling first
+	(root cause of the #3442 / SAL-ORD-2026-01169-1 drift, 2026-05-14).
+	Priority: 1 (alive) > 0 (draft) > 2 (cancelled).
+	"""
+	rows = frappe.get_all(
+		"Sales Order",
+		filters={ORDER_ID_FIELD: order_id},
+		fields=["name", "docstatus"],
+	)
+	if not rows:
+		return None
+	rows.sort(key=lambda r: {1: 0, 0: 1, 2: 2}.get(int(r["docstatus"] or 0), 3))
+	return frappe.get_doc("Sales Order", rows[0]["name"])
 
 
 def cancel_order(payload, request_id=None):
