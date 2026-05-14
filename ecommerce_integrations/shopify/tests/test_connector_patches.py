@@ -2234,16 +2234,20 @@ class TestV136HotpatchSourceInvariant(unittest.TestCase):
             "child SOI's ignore_validate_update_after_submit flag must be "
             "set before soi.qty = cq")
 
-    def test_class_b_parent_flag_set_when_qty_updated(self):
-        # When qty_updated is non-empty, the parent SO's
-        # ignore_validate_update_after_submit flag must be set before
-        # save() — mirrors accounts_controller.py:4167.
+    def test_class_b_parent_flag_set_in_save_block(self):
+        # yei-v1.3.7: parent flag must be set inside the
+        # ``if added or qty_updated:`` save block (no longer gated on
+        # ``if qty_updated:`` only — the add-only path needs it too).
+        # The flag must appear between the save-block guard and the
+        # ``sales_order.save(...)`` call.
         self.assertRegex(self.source,
-            r"if\s+qty_updated\s*:\s*\n"
-            r"\s*(?:#.*\n\s*)*"
-            r"sales_order\.flags\.ignore_validate_update_after_submit\s*=\s*True",
+            r"if\s+added\s+or\s+qty_updated\s*:\s*\n"
+            r"(?:.*\n)*?"
+            r"\s*sales_order\.flags\.ignore_validate_update_after_submit\s*=\s*True\s*\n"
+            r"(?:.*\n)*?"
+            r"\s*sales_order\.save\(ignore_permissions=True\)",
             "parent SO's ignore_validate_update_after_submit flag must be "
-            "set when qty_updated is non-empty")
+            "set inside the save block (added OR qty_updated)")
 
     def test_class_b_parent_flag_set_before_save(self):
         # Parent flag must be set before save().
@@ -2253,14 +2257,14 @@ class TestV136HotpatchSourceInvariant(unittest.TestCase):
             r"\s*sales_order\.save\(ignore_permissions=True\)",
             "parent flag must precede save()")
 
-    def test_version_bumped_to_136(self):
+    def test_version_bumped_to_137(self):
         init_py = os.path.join(
             os.path.dirname(SHOPIFY_DIR), "__init__.py"
         )
         with open(init_py, "r", encoding="utf-8") as f:
             init_source = f.read()
-        self.assertIn('__version__ = "1.3.6"', init_source,
-            "package version must be bumped to 1.3.6")
+        self.assertIn('__version__ = "1.3.7"', init_source,
+            "package version must be bumped to 1.3.7")
 
 
 def _reconcile_so_line_items_v136(sales_order_items, shopify_lines,
@@ -2329,10 +2333,11 @@ def _reconcile_so_line_items_v136(sales_order_items, shopify_lines,
 
         added.append(li.get("__item_code__") or f"SKU-{lid}")
 
-    # v1.3.6 Class B: parent flag set iff qty_updated is non-empty.
+    # v1.3.7: parent flag set whenever the save block fires — both
+    # ``added`` and ``qty_updated`` branches mutate parent-aggregate
+    # state (total_qty) and need the flag.
     if added or qty_updated:
-        if qty_updated:
-            parent_flags["__parent_flag_set__"] = True
+        parent_flags["__parent_flag_set__"] = True
 
     return added, refunded, qty_updated
 
@@ -2393,10 +2398,18 @@ class TestV136HotpatchBehaviour(unittest.TestCase):
         self.assertNotIn("__parent_flag_set__", parent_flags,
             "parent flag must not be set when qty_updated is empty")
 
-    def test_add_only_does_not_set_parent_qty_flag(self):
-        """When only added rows (no qty updates), parent flag should
-        NOT be set — the flag is qty-diff-specific. Add-only is
-        unblocked by the table-level Property Setter alone."""
+    def test_add_only_sets_parent_flag(self):
+        """yei-v1.3.7: add-only path also mutates parent ``total_qty``
+        (computed aggregate of items.qty) and therefore needs the
+        parent ``ignore_validate_update_after_submit`` flag.
+
+        Previously (v1.3.6) the flag was gated on ``if qty_updated:``,
+        so appending a new SOI to a submitted SO raised
+        ``UpdateAfterSubmitError: Not allowed to change Total Quantity
+        after submission from X to Y``. v1.3.7 widens the gate to fire
+        for the ``added`` branch too. The table-level Property Setter
+        (Sales Order.items.allow_on_submit=1) gates child add/remove
+        but does NOT gate parent-aggregate computed-field changes."""
         sales_order_items = []
         shopify_lines = [{
             "id": 999, "current_quantity": 1, "title": "New Item",
@@ -2410,9 +2423,9 @@ class TestV136HotpatchBehaviour(unittest.TestCase):
 
         self.assertEqual(added, ["SKU-999"])
         self.assertEqual(qty_updated, [])
-        self.assertNotIn("__parent_flag_set__", parent_flags,
-            "parent flag must not be set when only add rows — the table-"
-            "level Property Setter alone unblocks new-row inserts")
+        self.assertTrue(parent_flags.get("__parent_flag_set__"),
+            "parent flag must be set on add-only path — parent "
+            "total_qty mutates when SOIs are appended")
 
     def test_partial_refund_qty_change_sets_flags(self):
         """Mirrors #4485-style partial refund: qty drops but cq > 0.
@@ -2433,6 +2446,110 @@ class TestV136HotpatchBehaviour(unittest.TestCase):
         self.assertTrue(soi.get("__child_flag_set__"))
         self.assertTrue(parent_flags.get("__parent_flag_set__"))
         self.assertEqual(qty_updated, ["200"])
+
+
+class TestV137HotpatchSourceInvariant(unittest.TestCase):
+    """yei-v1.3.7 hotpatch: parent flag must fire for the add-only path.
+
+    v1.3.6 gated ``sales_order.flags.ignore_validate_update_after_submit
+    = True`` on ``if qty_updated:`` only — so appending a new SOI to a
+    submitted SO (the typical orders/edited reconcile case) hit
+    ``UpdateAfterSubmitError: Not allowed to change Total Quantity
+    after submission from X to Y`` because the parent's computed
+    ``total_qty`` aggregate changed. v1.3.7 hoists the flag out of the
+    ``if qty_updated:`` block so it fires whenever the save block runs
+    (i.e. for either ``added`` or ``qty_updated``).
+
+    These source-invariants pin the v1.3.7 fix: the flag must NOT be
+    nested inside ``if qty_updated:`` and must appear inside the
+    ``if added or qty_updated:`` save block before save().
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        order_py = os.path.join(SHOPIFY_DIR, "order.py")
+        with open(order_py, "r", encoding="utf-8") as f:
+            cls.source = f.read()
+
+    def test_parent_flag_not_gated_on_qty_updated_only(self):
+        # Regression guard: the v1.3.6 bug was
+        #     if qty_updated:
+        #         sales_order.flags.ignore_validate_update_after_submit = True
+        # The hoisted v1.3.7 form removes that nested ``if qty_updated:``
+        # right before the parent flag. Any reintroduction of that
+        # pattern fails this test.
+        self.assertNotRegex(self.source,
+            r"if\s+qty_updated\s*:\s*\n"
+            r"\s*(?:#.*\n\s*)*"
+            r"sales_order\.flags\.ignore_validate_update_after_submit\s*=\s*True",
+            "parent SO flag must NOT be nested inside `if qty_updated:` "
+            "— that's the v1.3.6 bug v1.3.7 fixes")
+
+    def test_parent_flag_fires_inside_save_block(self):
+        # The flag must appear between the ``if added or qty_updated:``
+        # guard and ``sales_order.save(...)`` — i.e. unconditionally
+        # whenever the save block runs.
+        self.assertRegex(self.source,
+            r"if\s+added\s+or\s+qty_updated\s*:\s*\n"
+            r"(?:.*\n)*?"
+            r"\s*sales_order\.flags\.ignore_validate_update_after_submit\s*=\s*True\s*\n"
+            r"(?:.*\n)*?"
+            r"\s*sales_order\.save\(ignore_permissions=True\)",
+            "parent SO flag must be set inside the save block, before save()")
+
+
+class TestV137HotpatchBehaviour(unittest.TestCase):
+    """yei-v1.3.7 hotpatch: behavioural test for the add-only path.
+
+    Reproduces the 2026-05-14 Class A retrofit failure mode:
+    11 SOs each had 1 SOI stamped with a Shopify lid; Shopify reported
+    1 additional new line on each SO; the reconciler entered the
+    add-only branch (``added`` non-empty, ``qty_updated`` empty); save
+    triggered parent-side validate_update_after_submit which rejected
+    the total_qty mutation with UpdateAfterSubmitError.
+
+    With the v1.3.7 fix, the parent flag fires for the add-only path
+    too — the save proceeds and the new SOI is appended.
+    """
+
+    def test_reconcile_pure_add_path_sets_parent_flag(self):
+        """Existing SO with SOI lid=A, Shopify reports [SOI lid=A
+        unchanged, new lid=B with cq>0]. Reconciler must end with
+        ``added`` non-empty, ``qty_updated`` empty, AND parent flag set.
+
+        This is the regression case for the 2026-05-14 Class A retrofit
+        failure: 11 SOs got ``UpdateAfterSubmitError`` because v1.3.6
+        gated the parent flag on ``if qty_updated:`` only.
+        """
+        soi_a = {"shopify_line_item_id": "1001", "qty": 1, "shopify_refunded": 0}
+        sales_order_items = [soi_a]
+        shopify_lines = [
+            {"id": 1001, "current_quantity": 1, "title": "Greenhouse A"},
+            {
+                "id": 1002, "current_quantity": 2, "title": "Accessory B",
+                "__item_code__": "ACC-NEW",
+            },
+        ]
+        parent_flags = {}
+
+        added, refunded, qty_updated = _reconcile_so_line_items_v136(
+            sales_order_items, shopify_lines, parent_flags=parent_flags,
+        )
+
+        # The new line was appended.
+        self.assertEqual(added, ["ACC-NEW"],
+            "new lid must be appended via the added branch")
+        # No qty changes on the existing line.
+        self.assertEqual(qty_updated, [],
+            "existing-lid qty matched — qty_updated must be empty")
+        # No refunds.
+        self.assertEqual(refunded, [])
+        # Parent flag set — this is the regression assertion.
+        self.assertTrue(parent_flags.get("__parent_flag_set__"),
+            "parent SO's ignore_validate_update_after_submit flag must "
+            "be set on the add-only path (v1.3.7 fix). Without it, "
+            "appending a new SOI to a submitted SO raises "
+            "UpdateAfterSubmitError on the parent total_qty mutation")
 
 
 if __name__ == "__main__":

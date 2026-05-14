@@ -995,6 +995,15 @@ def _reconcile_so_line_items(sales_order, full_order):
 	  Setter ``Sales Order Item.items.allow_on_submit=1`` (installed by
 	  patch ``add_so_item_allow_on_submit`` in v1.3.3) only gates
 	  add/delete; per-field ``qty`` edits need the flag.
+
+	yei-v1.3.7 widens the parent flag scope to also cover the ``added``
+	branch. Appending a new SOI to a submitted SO mutates the parent's
+	``total_qty`` (a computed aggregate of ``items.qty``); without the
+	parent flag, ``validate_update_after_submit`` rejects the save with
+	``UpdateAfterSubmitError: Not allowed to change Total Quantity after
+	submission from X to Y``. v1.3.6 gated the flag on ``if qty_updated:``
+	only — the ``added``-only path therefore hit the rejection. The
+	2026-05-14 Class A retrofit (11 pure-add SOs) surfaced the gap.
 	"""
 	from ecommerce_integrations.shopify.refund import flag_so_item_refunded
 
@@ -1080,15 +1089,22 @@ def _reconcile_so_line_items(sales_order, full_order):
 		sales_order.set_missing_values()
 		sales_order.calculate_taxes_and_totals()
 
-		if qty_updated:
-			# Parent-level flag — short-circuits validate_update_after_submit
-			# for the per-field qty edit on the existing SOI rows.
-			# See document.py:1098-1101 + accounts_controller.py:4167.
-			sales_order.flags.ignore_validate_update_after_submit = True
+		# yei-v1.3.7: parent-level flag fires for BOTH branches.
+		# `added` triggers parent ``total_qty`` mutation (computed aggregate
+		# of items.qty) which hits parent-side validate_update_after_submit;
+		# `qty_updated` triggers the same path via per-row qty edits. The
+		# table-level Property Setter ``Sales Order.items.allow_on_submit=1``
+		# permits child add/remove but does NOT permit parent computed-field
+		# changes. Without this flag, appending a new SOI to a submitted SO
+		# raises ``UpdateAfterSubmitError: Not allowed to change Total
+		# Quantity after submission from X to Y``.
+		# See document.py:1098-1101 + accounts_controller.py:4167.
+		sales_order.flags.ignore_validate_update_after_submit = True
 
 		# Required to flush new child rows / qty updates. Property Setter
 		# Sales Order Item.items.allow_on_submit=1 unblocks the submit-time
-		# write for new rows; the flag above unblocks per-field qty updates.
+		# write for new rows; the flag above unblocks parent-aggregate
+		# (total_qty) and per-field qty updates.
 		sales_order.save(ignore_permissions=True)
 
 	return added, refunded, qty_updated

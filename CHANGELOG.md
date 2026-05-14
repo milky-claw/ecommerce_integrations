@@ -10,6 +10,74 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.7] — 2026-05-14
+
+**Hotpatch for one v1.3.6 regression surfaced by the 2026-05-14 Class A retrofit (11 Baumera-cluster SOs).** v1.3.6 fixed the qty-update path (Class B) by setting `sales_order.flags.ignore_validate_update_after_submit = True` *only* when `qty_updated` is non-empty. The add-only path (Class B-add) still hit `UpdateAfterSubmitError: Not allowed to change Total Quantity after submission from X to Y` because appending an SOI mutates the parent's computed `total_qty` aggregate, which the parent-side `validate_update_after_submit` rejects without the flag. v1.3.7 hoists the parent flag out of `if qty_updated:` so it fires for both `added` and `qty_updated` branches.
+
+### Why
+
+The 2026-05-14 backfill stamped 22 `shopify_line_item_id` values on existing SOIs across 11 SOs (single-clause Class A scope: Baumera-cluster orders where the bare `<order>.pdf` invoice variant was missing the lid linker). Each replay was supposed to append exactly 1 new SOI (and SAL-ORD-2026-00946 +2) for the late-added Shopify line. Instead, every replay hit:
+
+```
+Not allowed to change Total Quantity after submission from 1.0 to 2.0
+Not allowed to change Total Quantity after submission from 3.0 to 9.0
+... (11 such rows in Ecommerce Integration Log)
+```
+
+The replay returns HTTP 200 with `status="Error"` on the EIL row (the handler's outer `try/except Exception` swallows the error into the log) — silently false-success at the HTTP layer.
+
+Root cause (single-clause): v1.3.6's save block (yei-v1.3.6 commit `1b517fe`, order.py:1083-1087):
+
+```python
+if qty_updated:
+    sales_order.flags.ignore_validate_update_after_submit = True
+sales_order.save(ignore_permissions=True)
+```
+
+The flag is gated on `qty_updated`. The `added`-only path bypasses it. But the parent-side validator (document.py:1098-1101 → controllers/accounts_controller.py) iterates the parent's computed fields and rejects `total_qty` mutation regardless of which branch caused it. The table-level Property Setter `Sales Order.items.allow_on_submit=1` (installed v1.3.3) permits child add/remove but does NOT permit parent computed-field changes.
+
+### Code changes
+
+- [`shopify/order.py:_reconcile_so_line_items`](ecommerce_integrations/shopify/order.py) — Single fix: hoist `sales_order.flags.ignore_validate_update_after_submit = True` out of the `if qty_updated:` nested block. Flag now fires whenever the save block runs (i.e. for either `added` or `qty_updated`). Updated docstring + inline comment to document the v1.3.7 reasoning.
+
+- [`__init__.py`](ecommerce_integrations/__init__.py) — Version bump 1.3.6 → 1.3.7.
+
+### Tests
+
+3 new tests in `tests/test_connector_patches.py`:
+
+- **`TestV137HotpatchSourceInvariant`** (2 tests):
+  - `test_parent_flag_not_gated_on_qty_updated_only` — regression guard via `assertNotRegex` against the v1.3.6 buggy pattern (`if qty_updated:` immediately followed by parent flag). Any reintroduction of the gate fails this test.
+  - `test_parent_flag_fires_inside_save_block` — positive assertion that the flag appears between the `if added or qty_updated:` guard and `sales_order.save(...)`.
+
+- **`TestV137HotpatchBehaviour`** (1 test):
+  - `test_reconcile_pure_add_path_sets_parent_flag` — behavioural unit via the inline `_reconcile_so_line_items_v136` helper (updated to v1.3.7 semantics). Setup: 1 existing SOI (lid=A, qty=1) + Shopify reports [lid=A unchanged, lid=B new with cq=2]. Asserts: `added=["ACC-NEW"]`, `qty_updated=[]`, parent flag set. This is the exact regression case the 2026-05-14 retrofit hit.
+
+Updated existing tests:
+
+- `TestV136HotpatchSourceInvariant.test_class_b_parent_flag_set_in_save_block` (renamed from `…_when_qty_updated`) — broader regex matching the hoisted flag.
+- `TestV136HotpatchSourceInvariant.test_version_bumped_to_137` (renamed; expects 1.3.7).
+- `TestV136HotpatchBehaviour.test_add_only_sets_parent_flag` (inverted from `_does_not_set_parent_qty_flag` — the prior test pinned the bug).
+- Inline `_reconcile_so_line_items_v136` helper updated: parent flag now fires on `if added or qty_updated:` (mirrors real code).
+
+Total: 165 tests in `test_connector_patches.py` (162 baseline + 3 new), 0 regressions across `test_b24_refunds.py` (57), `test_freight_class.py` (39), `test_supplier_sheet_3_issues.py` (65). Aggregate: 326 tests.
+
+### Reversibility
+
+Fully reversible by reverting this commit + redeploying yei-v1.3.6. The fix is pure-additive in semantics: the flag was already set in one branch; now it's set in both. The flag is ephemeral (in-memory, cleared between request cycles) and is the same primitive ERPNext's own `update_child_qty_rate` uses (accounts_controller.py:4167) for the same purpose.
+
+Rollback path: `git revert <commit>` + Press revert-candidate.
+
+### Refs
+
+- 2026-05-14 Class A retrofit ledger: `data/backfills/backfill_class_a_lid_stamps_2026-05-14.jsonl`
+- 11 failed EIL rows at 2026-05-14 16:12:37-44Z (each `NONE|Error` with "Not allowed to change Total Quantity after submission from X to Y")
+- accounts_controller.py:4167 (the blessed parent flag pattern)
+- document.py:1098-1101 (the validate_update_after_submit short-circuit)
+- v1.3.6 commit `1b517fe` (the gating bug we hotpatch)
+
+---
+
 ## [yei-v1.3.6] — 2026-05-14
 
 **Hotpatch for two v1.3.5 regressions surfaced by autopilot Phase 4 replay sweep (2026-05-14T01:50Z).** Phase 4 replayed 51 stuck SOs through `replay_handle_order_edited`; 28 failed Class A (`TypeError` in `calculate_commission`), 9 failed Class B (`UpdateAfterSubmitError` on per-field qty edit), 14 returned "Success +0 items" (false-negative matches — no work). Every Class A/B failure rolled back the transaction; bench state unchanged from Phase 0 snapshot.
