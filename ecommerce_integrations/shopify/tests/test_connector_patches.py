@@ -2570,14 +2570,20 @@ class TestV138GetSalesOrderDisambiguationSourceInvariant(unittest.TestCase):
         with open(order_py, "r", encoding="utf-8") as f:
             cls.source = f.read()
 
-    def test_version_bumped_to_138(self):
+    def test_version_at_or_above_138(self):
+        # Version pin moved forward across subsequent patch releases.
+        # Current floor: 1.3.8 (this class's release); each subsequent
+        # release class re-pins to its own version.
         init_py = os.path.join(
             os.path.dirname(SHOPIFY_DIR), "__init__.py"
         )
         with open(init_py, "r", encoding="utf-8") as f:
             init_source = f.read()
-        self.assertIn('__version__ = "1.3.8"', init_source,
-            "package version must be bumped to 1.3.8")
+        m = re.search(r'__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"', init_source)
+        self.assertIsNotNone(m, "package __version__ must be defined")
+        major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        self.assertGreaterEqual((major, minor, patch), (1, 3, 8),
+            f"package version must be at least 1.3.8, got {m.group(0)}")
 
     def test_get_sales_order_no_longer_uses_db_get_value(self):
         """Regression guard: the v1.3.7 bug was
@@ -2633,6 +2639,89 @@ class TestV138GetSalesOrderDisambiguationSourceInvariant(unittest.TestCase):
         body = m.group(1)
         self.assertRegex(body, r"if\s+not\s+rows\s*:\s*\n\s*return\s+None",
             "must return None when no SO matches the shopify_order_id")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# yei-v1.3.9 — @temp_shopify_session on handle_order_edited webhook
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestV139HandleOrderEditedSessionDecoratorSourceInvariant(unittest.TestCase):
+    """v1.3.9 adds ``@temp_shopify_session`` to ``handle_order_edited``.
+
+    Root cause uncovered 2026-05-14 by Shopify order #4978 (AfterSell Upsell
+    added GNR-AIR-VENT-MANU after initial order creation):
+
+    1. Shopify ``orders/edited`` webhook arrives at ``store_request_data``.
+    2. ``_validate_request`` HMAC-verifies the body — does NOT activate a
+       Shopify session.
+    3. ``process_request`` enqueues the handler via ``frappe.enqueue(
+       is_async=True, ...)`` — the worker runs in a fresh Frappe context
+       with no Shopify session.
+    4. ``handle_order_edited`` reaches ``Order.find(order_id)`` at
+       ``order.py:881`` (post-v1.3.3 get_sales_order succeeds, so we now
+       reach this line) and raises
+       ``ValueError: No shopify session is active``.
+
+    First live manifestation: EIL ``998sluhb19`` 2026-05-14 18:28:28Z —
+    AfterSell Upsell on Shopify #4978 → GNR-AIR-VENT-MANU never appended
+    to ERPNext SO → Baumera supplier sheet missing the line.
+
+    The v1.3.4 fix added ``@temp_shopify_session`` to the *replay wrapper*
+    only — relying on a docstring claim that ``_validate_request``
+    activates the session for the live webhook flow. That claim is false
+    (see ``connection.py:162-188``). v1.3.9 puts the decorator on the
+    webhook handler itself.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        order_py = os.path.join(SHOPIFY_DIR, "order.py")
+        with open(order_py, "r", encoding="utf-8") as f:
+            cls.source = f.read()
+
+    def test_version_at_or_above_139(self):
+        init_py = os.path.join(
+            os.path.dirname(SHOPIFY_DIR), "__init__.py"
+        )
+        with open(init_py, "r", encoding="utf-8") as f:
+            init_source = f.read()
+        m = re.search(r'__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"', init_source)
+        self.assertIsNotNone(m, "package __version__ must be defined")
+        major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        self.assertGreaterEqual((major, minor, patch), (1, 3, 9),
+            f"package version must be at least 1.3.9, got {m.group(0)}")
+
+    def test_handle_order_edited_has_temp_shopify_session_decorator(self):
+        """Decorator must directly precede the ``def handle_order_edited``
+        line. Webhook dispatch enqueues a background job; the worker has
+        no Shopify session unless we activate one. Without this, the
+        ``Order.find(order_id)`` REST call inside the handler raises
+        ``ValueError: No shopify session is active``."""
+        self.assertRegex(
+            self.source,
+            r"@temp_shopify_session\s*\ndef\s+handle_order_edited\(",
+            "@temp_shopify_session must directly precede "
+            "`def handle_order_edited(` — webhook dispatch runs in a "
+            "background worker with no session activated by "
+            "_validate_request",
+        )
+
+    def test_handle_order_edited_still_calls_order_find(self):
+        """Defensive: the body must still call Order.find — otherwise
+        the decorator is dead weight. This pins the requirement that
+        the handler fetches the full Shopify order (the webhook delta
+        alone is insufficient)."""
+        m = re.search(
+            r"def handle_order_edited\(.+?\n(?:def |class )",
+            self.source, re.DOTALL,
+        )
+        self.assertIsNotNone(m, "handle_order_edited must be defined")
+        body = m.group(0)
+        self.assertIn("Order.find(", body,
+            "handle_order_edited must call Order.find — the webhook "
+            "delta only carries {additions, removals} of line_item_ids; "
+            "SKUs/prices/titles need a full REST fetch")
 
 
 if __name__ == "__main__":

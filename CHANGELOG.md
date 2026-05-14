@@ -10,6 +10,56 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.3.9] — 2026-05-14
+
+**Hotpatch: live `orders/edited` webhook handler now activates a Shopify session.** Add `@temp_shopify_session` to `handle_order_edited` so the worker's `Order.find(order_id)` REST call inside the handler succeeds. First live manifestation surfaced 2026-05-14 18:28:28Z by Shopify order #4978 (AfterSell Upsell added GNR-AIR-VENT-MANU after initial order creation; webhook errored at `Order.find`; SOI never created; supplier sheet missed the line).
+
+### Why
+
+Webhook dispatch flow (verified by reading [`connection.py:135-159`](ecommerce_integrations/shopify/connection.py#L135-L159)):
+
+1. `store_request_data` receives the POST, runs HMAC validation via `_validate_request`.
+2. `_validate_request` ([connection.py:162-188](ecommerce_integrations/shopify/connection.py#L162-L188)) HMAC-verifies only — **does not activate a Shopify session**. The fork's prior docstring on `replay_handle_order_edited` ([order.py:966-968](ecommerce_integrations/shopify/order.py#L966-L968) pre-v1.3.9) claimed it did. False.
+3. `process_request` ([connection.py:148](ecommerce_integrations/shopify/connection.py#L148)) enqueues a **background job** via `frappe.enqueue(is_async=True, ...)`. The worker runs in a fresh Frappe context.
+4. The worker calls `handle_order_edited(payload, request_id)`. The first thing the handler needs is the full Shopify order — `Order.find(order_id)` at line 881 — because the webhook delta only carries `{additions, removals}` of line_item_ids, no SKUs/prices/titles.
+5. With no session: `shopify.base.connection` raises `ValueError: No shopify session is active`.
+
+Pre-v1.3.3 this was latent (every webhook short-circuited at `order_id=None` due to the payload-nesting bug). v1.3.3 fixed the payload nesting → `Order.find` actually runs → first session-bug manifestation. yei-v1.3.4 added `@temp_shopify_session` to the replay wrapper but not the webhook entry point.
+
+Empirical evidence (Ecommerce Integration Log `998sluhb19`):
+
+```
+2026-05-14 18:28:28.489872  handle_order_edited  Error
+message: orders/edited: Shopify REST fetch failed for order 11320385175915:
+         No shopify session is active
+traceback: order.py:881 → Order.find → connection → ValueError
+```
+
+### Code change
+
+- [`ecommerce_integrations/shopify/order.py`](ecommerce_integrations/shopify/order.py): single decorator add — `@temp_shopify_session` directly preceding `def handle_order_edited(...)`. Docstring updated to record the root-cause history.
+- [`ecommerce_integrations/__init__.py`](ecommerce_integrations/__init__.py): version bumped `1.3.8` → `1.3.9`.
+
+### Tests
+
+New test class `TestV139HandleOrderEditedSessionDecoratorSourceInvariant` in [`tests/test_connector_patches.py`](ecommerce_integrations/shopify/tests/test_connector_patches.py):
+
+- `test_version_at_or_above_139` — package version pin.
+- `test_handle_order_edited_has_temp_shopify_session_decorator` — regex assertion that `@temp_shopify_session` directly precedes the `def`.
+- `test_handle_order_edited_still_calls_order_find` — defensive: handler must still call `Order.find` (otherwise the decorator is dead weight; locks the requirement that the handler fetches the full Shopify order).
+
+Prior version pin in `TestV138GetSalesOrderDisambiguationSourceInvariant` changed from a fixed `1.3.8` string to a `>= 1.3.8` floor so subsequent patch bumps don't break the v1.3.8 test class.
+
+### Reversibility
+
+Single-decorator revert: remove the `@temp_shopify_session` line above `def handle_order_edited`. Bench: revert via Press to v1.3.8 candidate. Note: reverting reopens the live webhook bug — any incoming `orders/edited` will error at `Order.find`. Don't revert without replacing the handler entirely.
+
+### Blast radius before fix
+
+Every `orders/edited` webhook on prod since v1.3.3 went live was returning `Error` at `Order.find`. AfterSell Upsell, Shopify operator-side edits (rep adds a line after submit), customer-side edit-order flows — all of them failed silently into EIL `Error` rows. Until v1.3.9 deploys, `replay_handle_order_edited` is the only working path. Counted today: at least 1 live case (#4978). The wider population is "all post-v1.3.3 `orders/edited` EIL rows with `Error` status and the session-active traceback" — backfill scope for a separate sweep.
+
+---
+
 ## [yei-v1.3.7] — 2026-05-14
 
 **Hotpatch for one v1.3.6 regression surfaced by the 2026-05-14 Class A retrofit (11 Baumera-cluster SOs).** v1.3.6 fixed the qty-update path (Class B) by setting `sales_order.flags.ignore_validate_update_after_submit = True` *only* when `qty_updated` is non-empty. The add-only path (Class B-add) still hit `UpdateAfterSubmitError: Not allowed to change Total Quantity after submission from X to Y` because appending an SOI mutates the parent's computed `total_qty` aggregate, which the parent-side `validate_update_after_submit` rejects without the flag. v1.3.7 hoists the parent flag out of `if qty_updated:` so it fires for both `added` and `qty_updated` branches.

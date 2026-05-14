@@ -837,6 +837,7 @@ def cancel_order(payload, request_id=None):
 		create_shopify_log(status="Success")
 
 
+@temp_shopify_session
 def handle_order_edited(payload, request_id=None):
 	"""B13 / yei-v1.3.3: Handle ``orders/edited`` webhook.
 
@@ -857,6 +858,20 @@ def handle_order_edited(payload, request_id=None):
 	line_item_ids — no SKUs/prices. Full reconciliation requires a Shopify
 	REST fetch of the current order, then a diff by ``shopify_line_item_id``
 	(stamped on every SOI since v1.3.1 via Phase-A backfill).
+
+	yei-v1.3.9: ``@temp_shopify_session`` decorator added. Webhook dispatch
+	at ``connection.process_request`` enqueues a background job via
+	``frappe.enqueue(is_async=True, ...)`` — the worker runs in a fresh
+	Frappe context with no Shopify session activated. The handler's
+	``Order.find(order_id)`` REST call at line ~881 requires
+	``shopify.Session.activate_session(...)`` first, otherwise it raises
+	``ValueError: No shopify session is active``. The earlier comment on
+	``replay_handle_order_edited`` claiming the live webhook flow gets its
+	session via ``_validate_request`` was wrong — ``_validate_request``
+	only HMAC-verifies, never activates a Shopify session. First live
+	manifestation: 2026-05-14 18:28:28Z, Shopify order #4978
+	(AfterSell Upsell added GNR-AIR-VENT-MANU; webhook errored at
+	``Order.find``; SOI never created; supplier sheet missed the line).
 	"""
 	frappe.set_user("Administrator")
 	frappe.flags.request_id = request_id
