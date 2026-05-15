@@ -1227,6 +1227,40 @@ def replay_handle_order_edited(shopify_order_id, request_id=None):
 	return handle_order_edited(synthetic, request_id=request_id)
 
 
+@frappe.whitelist()
+def backfill_mirror(sales_order, value):
+	"""yei-v1.4.2: Admin-only entry point for backfilling
+	``shopify_fulfillment_status`` mirror on historical Sales Orders.
+
+	Uses ``frappe.db.set_value(..., update_modified=False)`` to bypass:
+	  1. ``UpdateAfterSubmitError`` (Custom Field has ``allow_on_submit=0``)
+	  2. The ygh_fedex ``cascade_post_submit_changes`` hook (which
+	     re-validates DN.items[*].so_detail and may explode on stale refs)
+
+	Same mechanism as yei-v1.3.10's prepare_delivery_note write; this
+	exposes it as a callable for one-shot backfills.
+
+	Caller must hold System Manager (or be Administrator). The admin-role
+	gate is the explicit trust boundary; no HMAC validation since this is
+	not a webhook entry point.
+	"""
+	if "System Manager" not in frappe.get_roles() and frappe.session.user != "Administrator":
+		frappe.throw(_("System Manager role required for backfill_mirror"))
+	if not frappe.db.exists("Sales Order", sales_order):
+		frappe.throw(_("Sales Order {0} not found").format(sales_order))
+	# Normalize: empty/None → empty string (mirror semantics)
+	normalized = value or ""
+	frappe.db.set_value(
+		"Sales Order",
+		sales_order,
+		"shopify_fulfillment_status",
+		normalized,
+		update_modified=False,
+	)
+	frappe.db.commit()
+	return {"sales_order": sales_order, "value": normalized}
+
+
 def _reconcile_so_line_items(sales_order, full_order):
 	"""yei-v1.3.6: reconcile ``sales_order.items`` against the current
 	Shopify lineItems.

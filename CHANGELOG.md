@@ -10,6 +10,38 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.4.2] — 2026-05-15
+
+### Added
+- `backfill_mirror` admin-only whitelisted method in
+  `shopify/order.py`. Uses `frappe.db.set_value(..., update_modified=False)`
+  to write `Sales Order.shopify_fulfillment_status` on submitted SOs,
+  bypassing both the `allow_on_submit=0` gate and the ygh_fedex
+  `cascade_post_submit_changes` hook.
+
+### Why
+- Mirror backfill 2026-05-14 (688 candidate SOs) left 4 with real-drift
+  payloads unwritten because the REST PUT path is doubly blocked.
+  v1.3.10's `prepare_delivery_note` mirror write only fires on
+  `fulfillments/create` webhook; terminal/un-fulfilled SOs never emit
+  more events. This method is the bridge.
+
+### Tests
+- `test_backfill_mirror_admin_only` — non-System-Manager → throw.
+- `test_backfill_mirror_writes_value` — set_value path called with
+  expected args.
+- `test_backfill_mirror_idempotent` — same-value re-call is no-op.
+- `test_backfill_mirror_normalizes_empty` — None → "".
+- `test_backfill_mirror_rejects_missing_so` — non-existent SO → throw.
+
+### Mechanism
+
+Mirrors `replay_handle_order_edited` (yei-v1.3.4) admin-gate pattern.
+Same module placement, same docstring style, same `frappe.session.user
+== "Administrator"` OR `"System Manager" in roles` gate.
+
+---
+
 ## [yei-v1.4.1] — 2026-05-15
 
 **Hotfix: `SETTING_DOCTYPE` import missing in `shopify_setting.py`** — `force_reregister_webhooks()` (introduced in v1.4.0) raised `NameError: name 'SETTING_DOCTYPE' is not defined` on first call post-deploy. Added the constant to the existing `from ecommerce_integrations.shopify.constants import (...)` block.
