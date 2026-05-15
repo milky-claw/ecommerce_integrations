@@ -1303,7 +1303,11 @@ def _reconcile_so_line_items(sales_order, full_order):
 	only — the ``added``-only path therefore hit the rejection. The
 	2026-05-14 Class A retrofit (11 pure-add SOs) surfaced the gap.
 	"""
-	from ecommerce_integrations.shopify.refund import flag_so_item_refunded
+	from ecommerce_integrations.shopify.refund import (
+		_find_dn_items_for_so_item,
+		flag_dn_item_refunded,
+		flag_so_item_refunded,
+	)
 
 	setting = frappe.get_doc(SETTING_DOCTYPE)
 	shopify_lines = full_order.get("line_items") or []
@@ -1336,6 +1340,14 @@ def _reconcile_so_line_items(sales_order, full_order):
 			soi = existing_by_lid.get(lid)
 			if soi and not cint(soi.get("shopify_refunded") or 0):
 				flag_so_item_refunded(sales_order.name, soi.name, now)
+				# 2026-05-15 Baumera-audit Q3/Q5 FAIL fix — mirror to any
+				# DNI(s) linked to this SOI. apply_refund does this via the
+				# refunds/create webhook path, but orders/edited (this
+				# handler) is a parallel SOI→refund-flag path that
+				# previously stopped at SOI, leaving DNI stale and
+				# rendering refunded lines as active on the supplier sheet.
+				for dn_name, dn_item_name in _find_dn_items_for_so_item(soi.name):
+					flag_dn_item_refunded(dn_name, dn_item_name, now)
 				refunded.append(lid)
 			continue
 

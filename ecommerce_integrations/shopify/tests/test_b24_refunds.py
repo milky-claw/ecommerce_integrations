@@ -747,5 +747,44 @@ class TestB24aHandleRefundCreatedIdempotency(unittest.TestCase):
         self.refund.apply_refund.assert_not_called()
 
 
+class TestReconcileMirrorsRefundToDNI(unittest.TestCase):
+    """2026-05-15 Baumera-audit Q3/Q5 FAIL fix.
+
+    `_reconcile_so_line_items` (orders/edited handler) is a parallel SOI
+    flagging path; pre-fix it called `flag_so_item_refunded` but not
+    `flag_dn_item_refunded`, leaving the DNI stale and the supplier-sheet
+    writer rendering refunded lines as active. The fix mirrors via
+    `_find_dn_items_for_so_item` + `flag_dn_item_refunded` immediately
+    after the SOI flag — same pattern as refund.py:apply_refund.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(ORDER_PY, "r", encoding="utf-8") as f:
+            cls.source = f.read()
+
+    def test_reconciler_imports_dn_mirror_helpers(self):
+        body = _source_of("_reconcile_so_line_items", self.source)
+        self.assertIn("flag_dn_item_refunded", body,
+            "_reconcile_so_line_items must import flag_dn_item_refunded "
+            "to mirror SOI refund flag onto matching DNIs (audit-2026-05-15 Q3/Q5)")
+        self.assertIn("_find_dn_items_for_so_item", body,
+            "_reconcile_so_line_items must import _find_dn_items_for_so_item "
+            "to locate DNIs linked to the flagged SOI")
+
+    def test_reconciler_calls_flag_dn_item_refunded_in_refund_branch(self):
+        """The DNI mirror must live inside the cq==0 refund branch, AFTER
+        flag_so_item_refunded — same idempotency contract as apply_refund."""
+        body = _source_of("_reconcile_so_line_items", self.source)
+        # Sequencing check: flag_so_item_refunded appears before
+        # flag_dn_item_refunded.
+        soi_idx = body.find("flag_so_item_refunded(sales_order.name")
+        dni_idx = body.find("flag_dn_item_refunded(")
+        self.assertGreater(soi_idx, -1, "flag_so_item_refunded call missing")
+        self.assertGreater(dni_idx, soi_idx,
+            "flag_dn_item_refunded must follow flag_so_item_refunded "
+            "(SOI flagged first; DNI mirror after)")
+
+
 if __name__ == "__main__":
     unittest.main()

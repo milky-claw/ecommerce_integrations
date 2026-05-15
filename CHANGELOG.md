@@ -10,6 +10,46 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.4.3] — 2026-05-15
+
+### Added
+- `_reconcile_so_line_items` (orders/edited handler) now mirrors the
+  SOI refund flag onto every linked DNI via
+  `_find_dn_items_for_so_item` + `flag_dn_item_refunded`, called
+  immediately after `flag_so_item_refunded`.
+
+### Why
+Paired with **ygf-v0.5.9** (materializer-side copy). Refund flagging
+has four paths into the SOI; pre-v1.4.3 only `refunds/create` →
+`apply_refund` mirrored to DNI. The orders/edited path (qty drop to
+zero is interpreted as a refund) flagged SOI but stopped there,
+leaving DNI stale. Audit 2026-05-15 surfaced 2 sheet-visible cases
+(#3843 WMP-FUL-0600X0300, #4291 RGB-GST-095X075H40); site-wide drift
+was 18 DNIs across 12 Draft DNs (workspace one-shot Server-Script
+backfill repaired pre-fix data; ygf-v0.5.9 closes the
+materialization-time half of the gap).
+
+### Tests
+`tests/test_b24_refunds.py::TestReconcileMirrorsRefundToDNI` (2
+source-invariant AST tests, matches B24's existing test style):
+1. `test_reconciler_imports_dn_mirror_helpers` — both
+   `flag_dn_item_refunded` and `_find_dn_items_for_so_item` appear
+   in the function body.
+2. `test_reconciler_calls_flag_dn_item_refunded_in_refund_branch` —
+   call ordering: SOI flagged first, DNI mirror after.
+
+Both pass; full `test_b24_refunds.py` 59/59.
+
+### Mechanism
+
+Drop-in copy of `apply_refund`'s mirror pattern at refund.py:174-176,
+sequenced after `flag_so_item_refunded` in the `cq == 0` refund
+branch. No new behaviour when no DNs exist for the SOI (loop is
+empty). Idempotent: `flag_dn_item_refunded` uses
+`frappe.db.set_value`; re-runs with the same value are no-ops.
+
+---
+
 ## [yei-v1.4.2] — 2026-05-15
 
 ### Added
