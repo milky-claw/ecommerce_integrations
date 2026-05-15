@@ -10,6 +10,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.4.1] — 2026-05-15
+
+**Hotfix: `SETTING_DOCTYPE` import missing in `shopify_setting.py`** — `force_reregister_webhooks()` (introduced in v1.4.0) raised `NameError: name 'SETTING_DOCTYPE' is not defined` on first call post-deploy. Added the constant to the existing `from ecommerce_integrations.shopify.constants import (...)` block.
+
+No behavioural change to v1.4.0's primary work (webhook handler, helpers, tests). Only the post-deploy admin helper was affected.
+
+---
+
 ## [yei-v1.4.0] — 2026-05-15
 
 **Subscribe to `orders/updated` for fulfillment + shipping-address mirror catch-up.** Adds the seventh Shopify webhook subscription with deliberately narrow scope: defense-in-depth on `fulfillment_status` and first-event coverage on `shipping_address` edits with 4-tier DN-state guard. Pairs with cohort B revert (33 SOs flipped from "On Hold" → "To Deliver and Bill" in same session).

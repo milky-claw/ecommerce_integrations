@@ -37,6 +37,7 @@ from ecommerce_integrations.shopify.constants import (
 	ORDER_NUMBER_FIELD,
 	ORDER_STATUS_FIELD,
 	ORDER_TIP_AMOUNT_FIELD,
+	SETTING_DOCTYPE,
 	SO_SHIP_CLASS_FIELD,
 	SUPPLIER_ID_FIELD,
 )
