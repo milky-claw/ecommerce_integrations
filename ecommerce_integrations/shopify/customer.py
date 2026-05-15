@@ -11,6 +11,10 @@ from ecommerce_integrations.shopify.constants import (
 	MODULE_NAME,
 	SETTING_DOCTYPE,
 )
+from ecommerce_integrations.shopify.utils import (
+	compute_line2_with_overflow,
+	split_phone_overflow,
+)
 
 
 class ShopifyCustomer(EcommerceCustomer):
@@ -107,13 +111,25 @@ class ShopifyCustomer(EcommerceCustomer):
 
 
 def _map_address_fields(shopify_address, customer_name, address_type, email):
-	"""returns dict with shopify address fields mapped to equivalent ERPNext fields"""
+	"""returns dict with shopify address fields mapped to equivalent ERPNext fields
+
+	yei-v1.4.5: phone-overflow handling. If shopify_address.phone fails
+	Frappe's validator (extensions, concatenated alternates), extract the
+	valid portion to Address.phone and append the FULL raw string to
+	Address.address_line2 as ``"<addr2> | Ph: <raw>"`` so the courier sees
+	complete context on the printed label.
+	"""
+	raw_phone = shopify_address.get("phone")
+	clean_phone, _has_overflow = split_phone_overflow(raw_phone)
+
 	address_fields = {
 		"address_title": customer_name,
 		"address_type": address_type,
 		ADDRESS_ID_FIELD: shopify_address.get("id"),
 		"address_line1": shopify_address.get("address1") or "Address 1",
-		"address_line2": shopify_address.get("address2"),
+		"address_line2": compute_line2_with_overflow(
+			shopify_address.get("address2"), raw_phone
+		),
 		"city": shopify_address.get("city"),
 		"state": shopify_address.get("province"),
 		"pincode": shopify_address.get("zip"),
@@ -121,8 +137,7 @@ def _map_address_fields(shopify_address, customer_name, address_type, email):
 		"email_id": email,
 	}
 
-	phone = shopify_address.get("phone")
-	if validate_phone_number(phone, throw=False):
-		address_fields["phone"] = phone
+	if clean_phone:
+		address_fields["phone"] = clean_phone
 
 	return address_fields

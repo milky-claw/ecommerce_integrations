@@ -10,6 +10,58 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.4.5] — 2026-05-15
+
+### Added
+- Phone-overflow handling for shipping addresses. When Shopify supplies a
+  phone string that fails Frappe's `validate_phone_number` regex
+  (extensions, concatenated alternates), the connector now extracts the
+  validator-passing portion to `Address.phone` and appends the FULL raw
+  string to `Address.address_line2` as `"<addr2> | Ph: <raw>"` so the
+  courier sees complete context on the printed FedEx label. The phone may
+  appear twice on the label (once in phone field, once in line2) —
+  by-design (user-approved 2026-05-15: "courier might not understand
+  otherwise").
+- Two helpers in `ecommerce_integrations.shopify.utils`:
+  `split_phone_overflow(raw)` → `(clean, has_overflow)` and
+  `compute_line2_with_overflow(shopify_address2, raw_phone)`. Idempotent
+  overwrite: line2 is fully recomputed from current Shopify state on every
+  `orders/updated` webhook tick — overwriting stale or manually-edited
+  values (Shopify is truth).
+
+### Changed
+- `customer.py:_map_address_fields` now derives `address_line2` and
+  `phone` via the overflow helpers instead of writing
+  `shopify_address.address2` + raw phone verbatim.
+- `order.py:_create_per_order_shipping_address` (per-order shipping
+  Address creation) wired through the same helpers.
+- `order.py:_handle_shipping_address_change` (orders/updated handler)
+  overrides the delta-loop's phone + line2 entries with the
+  overflow-aware computation — so a customer's fix in Shopify
+  (raw → validator-passing) drops the `"| Ph: …"` suffix on the next
+  webhook.
+
+### Why
+2026-05-15 audit surfaced two customers whose `Address.phone` was empty
+because the raw Shopify phone failed validation:
+`Christ the King Episcopal Church → "+1 415-419-8616 ext. 67911"` and
+`Ashley Grimes → "+1 6026716610 99999 8031791701"`. Couriers had no
+number to call. v1.4.5 preserves both fields: the validator-passing
+portion in `phone`, and the full raw string in `address_line2` for the
+printed-label fallback.
+
+### Tests
+- New `tests/test_phone_overflow.py` — 14 tests on pure helpers
+  (validator pass-through, extension-trim, concatenated-phone overflow,
+  empty/whitespace/unparseable inputs, line2 composition with/without
+  base addr2, idempotent overwrite).
+- `tests/test_supplier_sheet_3_issues.py` `_import_order_module` stub
+  refined: `utils` mock now returns real-shape `(clean, has_overflow)`
+  + line2 string instead of bare MagicMock objects (would have silently
+  failed tuple-unpack at the new `split_phone_overflow` call site).
+
+---
+
 ## [yei-v1.4.4] — 2026-05-15
 
 ### Fixed

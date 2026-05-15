@@ -377,8 +377,16 @@ def _import_order_module():
 	sys.modules.setdefault(
 		"ecommerce_integrations.shopify.product", MagicMock(),
 	)
+	# Real-ish utils stub: order.py calls split_phone_overflow + compute_line2_with_overflow
+	# at module load AND in _create_per_order_shipping_address — must return
+	# the right tuple/str shape, not raw MagicMocks.
+	_utils_stub = MagicMock()
+	_utils_stub.split_phone_overflow = lambda raw: (str(raw) if raw else "", False)
+	_utils_stub.compute_line2_with_overflow = (
+		lambda addr2, raw: str(addr2) if addr2 else ""
+	)
 	sys.modules.setdefault(
-		"ecommerce_integrations.shopify.utils", MagicMock(),
+		"ecommerce_integrations.shopify.utils", _utils_stub,
 	)
 	sys.modules.setdefault(
 		"ecommerce_integrations.utils", MagicMock(),

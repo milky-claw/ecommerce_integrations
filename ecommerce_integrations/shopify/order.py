@@ -35,7 +35,11 @@ from ecommerce_integrations.shopify.freight_class import (
 )
 from ecommerce_integrations.shopify.customer import ShopifyCustomer
 from ecommerce_integrations.shopify.product import create_items_if_not_exist, get_item_code
-from ecommerce_integrations.shopify.utils import create_shopify_log
+from ecommerce_integrations.shopify.utils import (
+	compute_line2_with_overflow,
+	create_shopify_log,
+	split_phone_overflow,
+)
 from ecommerce_integrations.utils.price_list import get_dummy_price_list
 from ecommerce_integrations.utils.taxation import get_dummy_tax_category
 
@@ -380,22 +384,26 @@ def _create_per_order_shipping_address(shopify_order, customer_name):
 	# Addresses (safe to update in place) from Customer-primary shared ones.
 	synthetic_id = ship.get("id") or f"order_{shopify_order.get('id')}_ship"
 
+	# yei-v1.4.5: phone overflow — split unparseable phone into clean
+	# Address.phone + raw appended to address_line2 (see utils.py).
+	raw_phone = ship.get("phone")
+	clean_phone, _has_overflow = split_phone_overflow(raw_phone)
+
 	addr_doc = {
 		"doctype": "Address",
 		"address_title": recipient,
 		"address_type": "Shipping",
 		ADDRESS_ID_FIELD: synthetic_id,
 		"address_line1": ship.get("address1") or "Address 1",
-		"address_line2": ship.get("address2"),
+		"address_line2": compute_line2_with_overflow(ship.get("address2"), raw_phone),
 		"city": ship.get("city"),
 		"state": ship.get("province"),
 		"pincode": ship.get("zip"),
 		"country": ship.get("country"),
 		"links": [{"link_doctype": "Customer", "link_name": customer_name}],
 	}
-	phone = ship.get("phone")
-	if phone:
-		addr_doc["phone"] = phone
+	if clean_phone:
+		addr_doc["phone"] = clean_phone
 
 	try:
 		doc = frappe.get_doc(addr_doc)
@@ -1169,6 +1177,27 @@ def _handle_shipping_address_change(sales_order, payload_addr):
 		cur_val = cstr(addr.get(addr_key) or "").strip()
 		if new_val != cur_val:
 			delta[addr_key] = new_val
+
+	# yei-v1.4.5: override phone + address_line2 with overflow-aware derivation.
+	# On every webhook tick, line2 is fully recomputed from current Shopify
+	# state — overwriting any stale or manually-edited value (Shopify is truth).
+	# Customer fix in Shopify → clean=raw → no overflow → suffix drops.
+	raw_phone = payload_addr.get("phone")
+	clean_phone, _has_overflow = split_phone_overflow(raw_phone)
+	new_line2 = compute_line2_with_overflow(payload_addr.get("address2"), raw_phone)
+
+	if clean_phone != cstr(addr.get("phone") or "").strip():
+		delta["phone"] = clean_phone
+	elif "phone" in delta:
+		# Loop above flagged a phone diff against raw; clean matched current.
+		# Drop the stale entry.
+		del delta["phone"]
+
+	if new_line2 != cstr(addr.get("address_line2") or "").strip():
+		delta["address_line2"] = new_line2
+	elif "address_line2" in delta:
+		# Loop flagged diff against raw shopify.address2; computed line2 matches.
+		del delta["address_line2"]
 
 	# Recipient name update (Address.address_title)
 	first = cstr(payload_addr.get("first_name") or "").strip()
