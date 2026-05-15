@@ -10,6 +10,39 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.4.4] — 2026-05-15
+
+### Fixed
+- `_handle_shipping_address_change` safety gate inversion. v1.4.1 refused
+  in-place updates on Addresses lacking `shopify_address_id` — but per-order
+  shipping Addresses created by `_create_per_order_shipping_address` never
+  carry a real id (Shopify's order-level `shipping_address` is a value
+  object with no `id`; only `customer.addresses[]` entries have ids). Net
+  effect: the gate refused the very Addresses it was designed to allow.
+- `_create_per_order_shipping_address` now stamps a synthetic
+  `shopify_address_id = "order_<shopify_order_id>_ship"` when
+  `ship.get("id")` is None, so per-order Addresses carry a unique key.
+- Safety gate replaced with the real signal: refuse update only when the
+  Address is referenced by >1 live Sales Order (`docstatus != 2`). Single-SO
+  Addresses are safe to update in place even if semantically "shared".
+
+### Why
+Discovered 2026-05-15 while investigating audit findings for #4097 + #3819.
+v1.4.1 shipped the `orders/updated` mirror path; the safety gate inversion
+silently dropped every legitimate per-order shipping-address update.
+
+### Tests
+`tests/test_order_updated.py`:
+- `test_handler_safety_gate_uses_linked_so_count` — source-invariant: gate
+  calls `frappe.db.count` against `Sales Order` filtered by
+  `shipping_address_name` + `docstatus != 2`.
+- `test_per_order_address_stamps_synthetic_id` — source-invariant:
+  `_create_per_order_shipping_address` builds `order_<id>_ship` fallback.
+- Existing `test_handler_shopify_address_id_safety_gate` updated to match
+  new gate (the symbol no longer appears in the gate body).
+
+---
+
 ## [yei-v1.4.3] — 2026-05-15
 
 ### Added

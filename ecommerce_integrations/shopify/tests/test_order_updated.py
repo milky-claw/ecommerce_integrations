@@ -210,12 +210,28 @@ class TestHandleOrderUpdatedSourceInvariant(unittest.TestCase):
         self.assertIn("log_error", body,
             "_handle_shipping_address_change must call frappe.log_error for tier 3/4 alerts")
 
-    def test_handler_shopify_address_id_safety_gate(self):
-        # In-place Address update must gate on shopify_address_id stamp
+    def test_handler_safety_gate_uses_linked_so_count(self):
+        # v1.4.4: gate flipped from `not ADDRESS_ID_FIELD` (which was
+        # inverted — refused per-order Addresses) to a true shared-Address
+        # signal: count live SOs referencing this Address via
+        # shipping_address_name.
         body = _source_of("_handle_shipping_address_change", self.source)
-        self.assertIn("ADDRESS_ID_FIELD", body,
-            "_handle_shipping_address_change must check ADDRESS_ID_FIELD before in-place update "
-            "(safety gate against shared Customer-primary Address)")
+        self.assertIn("frappe.db.count", body,
+            "_handle_shipping_address_change must call frappe.db.count to "
+            "measure how many SOs share this Address")
+        self.assertIn("shipping_address_name", body,
+            "_handle_shipping_address_change must filter on shipping_address_name")
+        self.assertRegex(body, r'linked_so_count\s*>\s*1',
+            "_handle_shipping_address_change must refuse only when >1 SO links here")
+
+    def test_per_order_address_stamps_synthetic_id(self):
+        # v1.4.4: _create_per_order_shipping_address falls back to a
+        # synthetic id "order_<shopify_order_id>_ship" when Shopify's
+        # order-level shipping_address has no id (which is always).
+        body = _source_of("_create_per_order_shipping_address", self.source)
+        self.assertRegex(body, r'order_\{[^}]*shopify_order[^}]*\}_ship',
+            "_create_per_order_shipping_address must synthesize "
+            "'order_<id>_ship' when ship.get('id') is None")
 
     def test_handler_skips_when_so_not_mirrored(self):
         # If get_sales_order returns None, handler must return without error

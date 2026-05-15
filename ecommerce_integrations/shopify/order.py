@@ -374,11 +374,17 @@ def _create_per_order_shipping_address(shopify_order, customer_name):
 	last = cstr(ship.get("last_name")).strip()
 	recipient = (f"{first} {last}").strip() or customer_name
 
+	# Shopify's order-level shipping_address is a value object with NO id (only
+	# customer.addresses[] entries have ids). Synthesize a unique key so the
+	# safety gate in _handle_shipping_address_change can distinguish per-order
+	# Addresses (safe to update in place) from Customer-primary shared ones.
+	synthetic_id = ship.get("id") or f"order_{shopify_order.get('id')}_ship"
+
 	addr_doc = {
 		"doctype": "Address",
 		"address_title": recipient,
 		"address_type": "Shipping",
-		ADDRESS_ID_FIELD: ship.get("id"),
+		ADDRESS_ID_FIELD: synthetic_id,
 		"address_line1": ship.get("address1") or "Address 1",
 		"address_line2": ship.get("address2"),
 		"city": ship.get("city"),
@@ -1130,13 +1136,28 @@ def _handle_shipping_address_change(sales_order, payload_addr):
 		)
 		return
 
-	# Safety gate: refuse in-place update on shared Addresses.
-	if not addr.get(ADDRESS_ID_FIELD):
+	# Safety gate: refuse in-place update on truly-shared Addresses.
+	# An Address referenced by >1 live Sales Order would have its update
+	# affect orders beyond this webhook payload — refuse, log, let manual
+	# review handle. Per-order Addresses created post yei-v1.3.13 by
+	# _create_per_order_shipping_address are typically 1:1 with their SO
+	# (each SO gets its own Address record). v1.4.1's shopify_address_id
+	# stamp gate was inverted: per-order Addresses never get a real id
+	# from Shopify (order-level shipping_address is a value object), so
+	# the gate refused exactly the Addresses it was meant to allow.
+	# Linkage from SO to Address goes through `Sales Order.shipping_address_name`
+	# (not Dynamic Link); count live SOs referencing this Address.
+	linked_so_count = frappe.db.count(
+		"Sales Order",
+		filters={"shipping_address_name": addr_name, "docstatus": ["!=", 2]},
+	)
+	if linked_so_count > 1:
 		frappe.log_error(
 			title="orders/updated: refused to update shared Address",
 			message=(
-				f"SO {sales_order.name} links to Address {addr_name} without shopify_address_id stamp. "
-				f"Likely shared Customer-primary; manual review required to apply Shopify-side edit."
+				f"SO {sales_order.name} links to Address {addr_name} which is "
+				f"shared across {linked_so_count} live SOs. Manual review required "
+				f"to apply Shopify-side edit without affecting siblings."
 			),
 		)
 		return
