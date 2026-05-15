@@ -963,6 +963,238 @@ def handle_order_edited(payload, request_id=None):
 		)
 
 
+def handle_order_updated(payload, request_id=None):
+	"""yei-v1.4.0: Handle ``orders/updated`` webhook (narrow scope).
+
+	Reacts to exactly two conditions; all other payload fields are ignored:
+
+	1. ``fulfillment_status == "fulfilled"`` — defense-in-depth mirror catch-up
+	   when ``orders/fulfilled`` is missed (Shopify retry exhaustion, queue
+	   stall). Idempotent: no-op if mirror already at "fulfilled".
+
+	2. ``shipping_address`` differs from SO's linked Address — mirror Shopify
+	   address edits into ERPNext, with awareness of linked DN AWB state.
+	   Update the per-order Address record in place (safe: ``shopify_address_id``
+	   stamp gates against shared-Address Customer-primary risk). Tier 3+4
+	   (AWB minted) additionally logs an alert to ``frappe.error_log`` for
+	   ops review. Telegram integration deferred (separate workspace-side
+	   commit will route ``error_log`` Tier 3/4 entries to Kete's chat).
+
+	Explicitly out of scope (ignored): ``financial_status``, ``tags``,
+	``note``, ``customer.*``, ``email``, fulfillment_status values OTHER than
+	"fulfilled".
+
+	Idempotency: handler reads SO state, compares to payload, writes only on
+	delta. Equal state → no DB write → no further events → no loop.
+	"""
+	frappe.set_user("Administrator")
+	frappe.flags.request_id = request_id
+
+	try:
+		shopify_order_id = str(payload.get("id") or "")
+		if not shopify_order_id:
+			return
+
+		sales_order = get_sales_order(shopify_order_id)
+		if not sales_order:
+			# SO not mirrored yet — orders/create handles eventually
+			return
+
+		any_change = False
+
+		# Condition 1: fulfillment_status catch-up
+		if (
+			payload.get("fulfillment_status") == "fulfilled"
+			and sales_order.get(ORDER_FULFILLMENT_STATUS_FIELD) != "fulfilled"
+		):
+			frappe.db.set_value(
+				"Sales Order",
+				sales_order.name,
+				ORDER_FULFILLMENT_STATUS_FIELD,
+				"fulfilled",
+				update_modified=False,
+			)
+			any_change = True
+
+		# Condition 2: shipping_address subset change
+		payload_addr = payload.get("shipping_address") or {}
+		if payload_addr and _shipping_address_differs(sales_order, payload_addr):
+			_handle_shipping_address_change(sales_order, payload_addr)
+			any_change = True
+
+		if any_change:
+			create_shopify_log(
+				status="Success",
+				message=f"orders/updated processed for SO {sales_order.name}",
+			)
+
+	except Exception as e:
+		create_shopify_log(status="Error", exception=e)
+
+
+# Map of Shopify shipping_address keys → ERPNext Address doctype field names.
+# Subset is "what goes on a FedEx label." Excludes company/email (no direct
+# Address-doctype field) and latitude/longitude (irrelevant for shipping ops).
+_SHIPPING_ADDR_FIELD_MAP = {
+	"address1": "address_line1",
+	"address2": "address_line2",
+	"city": "city",
+	"province": "state",
+	"zip": "pincode",
+	"country": "country",
+	"phone": "phone",
+}
+
+
+def _shipping_address_differs(sales_order, payload_addr):
+	"""Compare payload shipping_address subset to SO's linked Address.
+
+	Returns True if any field in ``_SHIPPING_ADDR_FIELD_MAP`` differs.
+	Also checks address_title (recipient name from first_name + last_name).
+	"""
+	addr_name = sales_order.get("shipping_address_name")
+	if not addr_name:
+		# No linked address → any payload address counts as a change
+		return bool(payload_addr.get("address1") or payload_addr.get("city"))
+	try:
+		addr = frappe.get_doc("Address", addr_name)
+	except frappe.DoesNotExistError:
+		return True
+
+	for shopify_key, addr_key in _SHIPPING_ADDR_FIELD_MAP.items():
+		new_val = cstr(payload_addr.get(shopify_key) or "").strip()
+		cur_val = cstr(addr.get(addr_key) or "").strip()
+		if new_val != cur_val:
+			return True
+
+	# Recipient name (Address.address_title) check
+	first = cstr(payload_addr.get("first_name") or "").strip()
+	last = cstr(payload_addr.get("last_name") or "").strip()
+	new_title = (f"{first} {last}").strip()
+	if new_title and new_title != cstr(addr.get("address_title") or "").strip():
+		return True
+
+	return False
+
+
+def _compute_tier(sales_order_name):
+	"""Compute DN tier for a SO. Returns (tier, list_of_alive_dn_names).
+
+	Tier 1: no alive DN (or all linked DNs are docstatus=2)
+	Tier 2: alive DN(s) exist, none have fedex_awb_number
+	Tier 3: alive DN(s) with fedex_awb_number, none yet picked-up
+	Tier 4: alive DN(s) with fedex_awb_number AND pickup status indicating pickup happened
+	"""
+	dn_rows = frappe.get_all(
+		"Delivery Note",
+		filters=[
+			["Delivery Note Item", "against_sales_order", "=", sales_order_name],
+			["docstatus", "!=", 2],
+		],
+		fields=["name", "fedex_awb_number", "fedex_pickup_status"],
+	)
+	if not dn_rows:
+		return 1, []
+	has_awb = [r for r in dn_rows if r.get("fedex_awb_number")]
+	if not has_awb:
+		return 2, [r["name"] for r in dn_rows]
+	picked = any(
+		(r.get("fedex_pickup_status") or "").upper() in ("PICKED_UP", "IN_TRANSIT", "DELIVERED")
+		for r in has_awb
+	)
+	return (4 if picked else 3), [r["name"] for r in dn_rows]
+
+
+def _handle_shipping_address_change(sales_order, payload_addr):
+	"""Update the SO's linked Address record in place, log alert if tier ≥ 3.
+
+	Safety gate: only update Addresses that carry ``shopify_address_id`` —
+	these are per-order Address records created by
+	``_create_per_order_shipping_address``. Skipping in-place update on
+	shared Addresses (e.g. Customer-primary) prevents cross-doc surprises.
+	"""
+	addr_name = sales_order.get("shipping_address_name")
+	if not addr_name:
+		frappe.log_error(
+			title="orders/updated: SO missing shipping_address_name",
+			message=f"SO {sales_order.name}: cannot apply shipping_address edit (no linked Address)",
+		)
+		return
+
+	try:
+		addr = frappe.get_doc("Address", addr_name)
+	except frappe.DoesNotExistError:
+		frappe.log_error(
+			title="orders/updated: linked Address missing",
+			message=f"SO {sales_order.name} points at Address {addr_name} which no longer exists",
+		)
+		return
+
+	# Safety gate: refuse in-place update on shared Addresses.
+	if not addr.get(ADDRESS_ID_FIELD):
+		frappe.log_error(
+			title="orders/updated: refused to update shared Address",
+			message=(
+				f"SO {sales_order.name} links to Address {addr_name} without shopify_address_id stamp. "
+				f"Likely shared Customer-primary; manual review required to apply Shopify-side edit."
+			),
+		)
+		return
+
+	# Build delta
+	delta = {}
+	for shopify_key, addr_key in _SHIPPING_ADDR_FIELD_MAP.items():
+		new_val = cstr(payload_addr.get(shopify_key) or "").strip()
+		cur_val = cstr(addr.get(addr_key) or "").strip()
+		if new_val != cur_val:
+			delta[addr_key] = new_val
+
+	# Recipient name update (Address.address_title)
+	first = cstr(payload_addr.get("first_name") or "").strip()
+	last = cstr(payload_addr.get("last_name") or "").strip()
+	new_title = (f"{first} {last}").strip()
+	if new_title and new_title != cstr(addr.get("address_title") or "").strip():
+		delta["address_title"] = new_title
+
+	if not delta:
+		return  # no-op
+
+	tier, dn_names = _compute_tier(sales_order.name)
+
+	# Apply update to Address record. Address.save() triggers re-render of
+	# linked-doc display fields (SO.shipping_address HTML, DN.shipping_address)
+	# via Frappe's standard hook chain.
+	for k, v in delta.items():
+		setattr(addr, k, v)
+	addr.flags.ignore_permissions = True
+	try:
+		addr.save()
+	except Exception as save_err:  # noqa: BLE001
+		frappe.log_error(
+			title="orders/updated: Address.save() failed",
+			message=f"SO {sales_order.name}, Address {addr_name}, delta={delta}: {save_err}",
+		)
+		return
+
+	# Tier-based alert. Telegram integration deferred (v1.4.0 logs only).
+	if tier >= 3:
+		urgency = "URGENT TRUCK ROLLING" if tier == 4 else "AWB minted pre-pickup"
+		action = (
+			"Manual intercept — call FedEx customer service" if tier == 4
+			else "Decide cancel-and-remint (free pre-pickup) or accept divergence"
+		)
+		frappe.log_error(
+			title=f"orders/updated Tier {tier} address drift — {urgency}",
+			message=(
+				f"SO: {sales_order.name} (Shopify #{sales_order.get(ORDER_NUMBER_FIELD) or '?'})\n"
+				f"Customer: {sales_order.customer}\n"
+				f"DN(s) affected: {dn_names}\n"
+				f"Address delta: {delta}\n"
+				f"Action: {action}"
+			),
+		)
+
+
 @frappe.whitelist()
 @temp_shopify_session
 def replay_handle_order_edited(shopify_order_id, request_id=None):

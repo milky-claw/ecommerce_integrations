@@ -270,6 +270,39 @@ class ShopifySetting(SettingController):
 		}
 
 
+@frappe.whitelist()
+def force_reregister_webhooks():
+	"""Force re-register all webhooks from current ``WEBHOOK_EVENTS``.
+
+	Use after a yei upgrade that adds new topics to ``WEBHOOK_EVENTS``. The
+	standard ``_handle_webhooks`` validate hook only registers when the
+	``webhooks`` child table is empty — so existing setups skip new topics
+	unless explicitly cleared first.
+
+	Mechanism:
+	  1. Delete child rows in Shopify Webhooks table
+	  2. Reload Shopify Setting
+	  3. Save (which fires ``validate`` → ``_handle_webhooks`` → full re-register)
+
+	Returns the new webhook count.
+
+	System Manager / Administrator only.
+	"""
+	if "System Manager" not in frappe.get_roles() and frappe.session.user != "Administrator":
+		frappe.throw(_("System Manager role required for force_reregister_webhooks"))
+
+	setting = frappe.get_doc(SETTING_DOCTYPE)
+	frappe.db.delete("Shopify Webhooks", {"parent": setting.name})
+	frappe.db.commit()
+	setting.reload()
+	setting.save(ignore_permissions=True)
+
+	return {
+		"webhooks_registered": len(setting.webhooks),
+		"topics": [w.method for w in setting.webhooks],
+	}
+
+
 def setup_custom_fields():
 	custom_fields = {
 		# B21: shopify_selling_rate retired — use native Item.standard_rate.

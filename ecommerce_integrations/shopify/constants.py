@@ -15,6 +15,8 @@ WEBHOOK_EVENTS = [
 	"orders/cancelled",
 	"orders/partially_fulfilled",
 	"orders/edited",
+	# v1.4.0: orders/updated for fulfillment defense-in-depth + shipping_address mirror
+	"orders/updated",
 	# B5: product webhooks so tag changes (ship-sea/ship-air/ship-dropship,
 	# warranty, stockv1/v2, etc.) flow to Item.shopify_tags in real time.
 	"products/create",
@@ -30,6 +32,7 @@ EVENT_MAPPER = {
 	"orders/cancelled": "ecommerce_integrations.shopify.order.cancel_order",
 	"orders/partially_fulfilled": "ecommerce_integrations.shopify.fulfillment.prepare_delivery_note",
 	"orders/edited": "ecommerce_integrations.shopify.order.handle_order_edited",
+	"orders/updated": "ecommerce_integrations.shopify.order.handle_order_updated",  # v1.4.0
 	"products/create": "ecommerce_integrations.shopify.product.sync_product_from_webhook",  # B5
 	"products/update": "ecommerce_integrations.shopify.product.sync_product_from_webhook",  # B5
 	"refunds/create": "ecommerce_integrations.shopify.refund.handle_refund_created",  # B24

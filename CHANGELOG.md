@@ -10,6 +10,79 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versio
 
 ---
 
+## [yei-v1.4.0] — 2026-05-15
+
+**Subscribe to `orders/updated` for fulfillment + shipping-address mirror catch-up.** Adds the seventh Shopify webhook subscription with deliberately narrow scope: defense-in-depth on `fulfillment_status` and first-event coverage on `shipping_address` edits with 4-tier DN-state guard. Pairs with cohort B revert (33 SOs flipped from "On Hold" → "To Deliver and Bill" in same session).
+
+### Why
+
+Two gaps in webhook coverage:
+
+1. **Defense-in-depth on fulfillment.** `orders/fulfilled` already writes `shopify_fulfillment_status="fulfilled"` (since yei-v1.3.10 closed the architectural gap there). But if `orders/fulfilled` is missed (Shopify retry exhaustion, queue stall, transient handler exception), the mirror stays empty until a chance `orders/edited` triggers a full refresh. `orders/updated` fires on every order-object mutation, so it's the natural catch-up channel.
+
+2. **No event covers shipping-address edits.** When a Shopify rep edits ship-to (typo correction, customer call-in), neither `orders/create` nor `orders/edited` nor `orders/paid` fires. The ERPNext mirror stays stale; supplier sheets show the OLD address. Critical pre-AWB; intervention-worthy post-AWB.
+
+### What changes
+
+**Subscribed events:** `orders/updated` added to `WEBHOOK_EVENTS` + `EVENT_MAPPER` in `shopify/constants.py`.
+
+**Handler (`shopify/order.py`):** new `handle_order_updated(payload, request_id=None)` reacts to exactly two conditions:
+
+| Condition | Action |
+|---|---|
+| Payload `fulfillment_status == "fulfilled"` AND SO mirror != "fulfilled" | Write SO mirror via `frappe.db.set_value(update_modified=False)` |
+| Payload `shipping_address` differs from SO's linked Address (field-by-field on labelled subset) | Invoke 4-tier subhandler |
+
+The labelled subset (fields that go on a FedEx label): `address1`, `address2`, `city`, `province` (→ Address.state), `zip` (→ pincode), `country`, `phone`, plus `first_name`+`last_name` (→ Address.address_title). Excluded: `company`, `email`, `latitude`, `longitude`.
+
+**4-tier DN-state guard (`_compute_tier`):**
+
+| Tier | DN state | Action |
+|---|---|---|
+| 1 | No alive DN | Update SO + linked Address. Silent. |
+| 2 | Alive DN(s) draft, no AWB | Update SO + linked Address (cascades to DN.shipping_address rendering). Silent. |
+| 3 | AWB minted, pre-pickup | Update SO + linked Address. Log alert via `frappe.log_error` (Tier 3) for ops review. |
+| 4 | AWB + pickup (PICKED_UP / IN_TRANSIT / DELIVERED) | Update SO + linked Address. Log URGENT alert. |
+
+**Safety gate:** in-place Address update only runs if the Address record carries `shopify_address_id` (i.e., is a per-order Address from `_create_per_order_shipping_address`). Shared Addresses (e.g. Customer-primary) are refused — manual review path. Prevents cross-doc surprises.
+
+**Explicitly out of scope:**
+
+- `financial_status` mirror. The "BNPL pending→paid unhold" use case is genuine but the derivation `financial_status in ("pending", "partially_paid") → On Hold` was flagged as flawed (ygf-v0.5.8 CHANGELOG). Re-attempt requires a real Shopify hold signal (e.g., `fulfillment_orders[].request_status == "ON_HOLD"`). Out of scope for v1.4.0.
+- `tags`, `note`, `customer.*`, `email` — no downstream ERPNext consumer.
+- `fulfillment_status` values OTHER than `"fulfilled"` (un-fulfill, partial, restocked, null) — `orders/fulfilled` + `orders/partially_fulfilled` already cover those transitions.
+- Telegram POST for Tier 3/4 alerts. Handler logs via `frappe.log_error`; a separate workspace-side commit will route those error_log entries to Kete's chat. Out of band, not blocking.
+
+**Idempotency:** handler reads SO + Address state, compares to payload, writes only on delta. Equal state → no DB write → no further events → no loop. This pattern survives the future ygf → Shopify fulfillment push (currently out of scope): handler will read `shopify_fulfillment_status == "fulfilled"`, payload will agree, no-op.
+
+**Companion helper:** `force_reregister_webhooks()` added to `shopify_setting.py` (whitelisted, System-Manager-only). Clears the `Shopify Webhooks` child table and saves Setting → triggers `_handle_webhooks` → full unregister+re-register from current `WEBHOOK_EVENTS`. Used once post-deploy to add `orders/updated` to existing Shopify-side registrations (the install hook only fires on empty child table).
+
+### Files
+
+| File | Change |
+|---|---|
+| `ecommerce_integrations/shopify/constants.py` | Add `"orders/updated"` to `WEBHOOK_EVENTS` + `EVENT_MAPPER` |
+| `ecommerce_integrations/shopify/order.py` | New `handle_order_updated` + 3 helpers (`_shipping_address_differs`, `_handle_shipping_address_change`, `_compute_tier`) + `_SHIPPING_ADDR_FIELD_MAP` constant |
+| `ecommerce_integrations/shopify/doctype/shopify_setting/shopify_setting.py` | New `force_reregister_webhooks` whitelisted helper |
+| `ecommerce_integrations/shopify/tests/test_order_updated.py` | NEW — 33 bench-independent tests |
+| `docs/orders-updated-design.md` | NEW — design doc |
+
+### Tests
+
+33/33 PASS on `python3 ecommerce_integrations/shopify/tests/test_order_updated.py`:
+
+- 2 TestConstantsRegistration (WEBHOOK_EVENTS + EVENT_MAPPER)
+- 11 TestHandleOrderUpdatedSourceInvariant (handler shape, narrow-scope guards, helper existence, idempotency pattern, safety gate, SO-not-mirrored skip)
+- 3 TestForceReregisterHelper (whitelist decorator, child-table clear, role gate)
+- 9 TestShippingAddressDiffersBehavioral (identical/changed/whitespace/null cases)
+- 8 TestComputeTierBehavioral (tier 1/2/3/4 paths, multiple DN aggregation, case-insensitive pickup status)
+
+### Pairs with
+
+Workspace cohort B revert run 2026-05-15 (33 SOs flipped from "On Hold" → "To Deliver and Bill" via `erpnext.selling.doctype.sales_order.sales_order.update_status`). Same root-cause family: financial_status derivation flagged as flawed; the revert cleans historical residue; this patch ensures future shipping-address edits + fulfilled defense-in-depth flow correctly.
+
+---
+
 ## [yei-v1.3.10] — 2026-05-14
 
 **`prepare_delivery_note` mirrors `Sales Order.shopify_fulfillment_status`.** Closes the architectural gap where Shopify's `orders/fulfilled` + `orders/partially_fulfilled` webhooks created a DN but never updated the SO-side mirror field, causing ~240+ SOs to drift in any 30-day window.
